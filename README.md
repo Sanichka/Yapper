@@ -217,7 +217,7 @@ and produces a debug-signed APK.
 ## Releases and CI
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) builds the desktop bundles
-(Windows NSIS, macOS DMG, Linux DEB/AppImage) and an Android arm64 APK.
+(Windows NSIS, macOS DMG, Linux DEB) and an Android arm64 APK.
 
 The workflow only builds when the pushed commit message contains the version from
 `Cargo.toml` (for example `Release v0.0.1`) or when a matching `v<version>` tag is pushed.

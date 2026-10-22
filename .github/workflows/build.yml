@@ -100,10 +100,8 @@ jobs:
             artifacts: target/release/bundle/dmg/*.dmg
           - os: ubuntu-22.04
             name: linux-x64
-            bundles: deb,appimage
-            artifacts: |
-              target/release/bundle/deb/*.deb
-              target/release/bundle/appimage/*.AppImage
+            bundles: deb
+            artifacts: target/release/bundle/deb/*.deb
     steps:
       - uses: actions/checkout@v4
 
@@ -144,8 +142,32 @@ jobs:
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Build ${{ matrix.name }}
+        if: runner.os != 'Linux'
         working-directory: apps/tiktok-tts-app
         run: cargo tauri build --bundles ${{ matrix.bundles }} --ci
+
+      - name: Build ${{ matrix.name }}
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: apps/tiktok-tts-app
+        run: |
+          set -o pipefail
+          cargo tauri build --bundles ${{ matrix.bundles }} --ci 2>&1 | tee tauri-build.log
+
+      - name: Report Linux build failure
+        if: failure() && runner.os == 'Linux'
+        shell: bash
+        working-directory: apps/tiktok-tts-app
+        run: |
+          python3 - <<'PY'
+          import os
+          path = "tauri-build.log"
+          if os.path.exists(path):
+              text = open(path, errors="replace").read()[-6000:]
+              text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=Linux build failed::{text}")
+          PY
+          exit 1
 
       - uses: actions/upload-artifact@v4
         with:
@@ -237,5 +259,4 @@ jobs:
             dist/**/*.exe
             dist/**/*.dmg
             dist/**/*.deb
-            dist/**/*.AppImage
             dist/**/*.apk
