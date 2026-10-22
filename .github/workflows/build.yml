@@ -1,0 +1,235 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yapper-build
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: true
+
+jobs:
+  version:
+    name: Version gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect version and decide whether to build
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
+          tauri_version="$(grep -m1 '"version"' apps/tiktok-tts-app/tauri.conf.json | cut -d '"' -f4)"
+          ui_version="$(grep -m1 '"version"' apps/tiktok-tts-app/ui/package.json | cut -d '"' -f4)"
+
+          if [ -z "$version" ]; then
+            echo "Could not read the workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "$version" != "$tauri_version" ]; then
+            echo "Version mismatch: Cargo.toml=$version tauri.conf.json=$tauri_version" >&2
+            exit 1
+          fi
+          if [ "$version" != "$ui_version" ]; then
+            echo "Version mismatch: Cargo.toml=$version ui/package.json=$ui_version" >&2
+            exit 1
+          fi
+
+          tag="v$version"
+          should_build=false
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            should_build=true
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$GITHUB_REF_NAME" = "$tag" ]; then
+              should_build=true
+            else
+              echo "Tag $GITHUB_REF_NAME does not match $tag; skipping build."
+            fi
+          else
+            message="$(git log -1 --format=%B)"
+            escaped="${version//./\\.}"
+            if printf '%s\n' "$message" | grep -qiE "(^|[^0-9A-Za-z])v?${escaped}([^0-9A-Za-z]|$)"; then
+              should_build=true
+            else
+              echo "Commit message does not mention $tag (or $version); skipping build."
+            fi
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $version (tag $tag), build: $should_build"
+
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    needs: version
+    if: needs.version.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            bundles: nsis
+            artifacts: target/release/bundle/nsis/*.exe
+          - os: macos-latest
+            name: macos-arm64
+            bundles: dmg
+            artifacts: target/release/bundle/dmg/*.dmg
+          - os: ubuntu-22.04
+            name: linux-x64
+            bundles: deb,appimage
+            artifacts: |
+              target/release/bundle/deb/*.deb
+              target/release/bundle/appimage/*.AppImage
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/tiktok-tts-app/ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.name }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/tiktok-tts-app/ui
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build ${{ matrix.name }}
+        working-directory: apps/tiktok-tts-app
+        run: cargo tauri build --bundles ${{ matrix.bundles }} --ci
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yapper-${{ matrix.name }}-v${{ needs.version.outputs.version }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+          retention-days: 30
+
+  android:
+    name: Android (arm64)
+    needs: version
+    if: needs.version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      NDK_VERSION: 27.0.12077973
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/tiktok-tts-app/ui/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "platforms;android-36" "build-tools;35.0.0" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/tiktok-tts-app/ui
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Initialize Android project
+        working-directory: apps/tiktok-tts-app
+        run: cargo tauri android init --ci
+
+      - name: Build debug APK
+        working-directory: apps/tiktok-tts-app
+        run: cargo tauri android build --apk --target aarch64 --debug --ci
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yapper-android-arm64-v${{ needs.version.outputs.version }}
+          path: apps/tiktok-tts-app/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub release
+    needs: [version, desktop, android]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List release files
+        run: find dist -type f -print
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Yapper ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/**/*.exe
+            dist/**/*.dmg
+            dist/**/*.deb
+            dist/**/*.AppImage
+            dist/**/*.apk

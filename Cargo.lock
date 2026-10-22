@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "kittentts-rs"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "any_ascii",
  "base64 0.22.1",
@@ -4291,7 +4291,7 @@ dependencies = [
 
 [[package]]
 name = "tiklive-rs"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "flate2",
  "futures-util",
@@ -4309,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "tiktok-tts-app"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "base64 0.22.1",

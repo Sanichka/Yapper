@@ -1,15 +1,3 @@
-mod config;
-mod core;
-#[cfg(feature = "desktop")]
-mod desktop;
-mod server;
-
-#[cfg(all(not(feature = "onnx"), not(feature = "onnx-dynamic")))]
-compile_error!(
-    "Yapper needs a TTS backend: build with `--features onnx` (bundled ONNX Runtime) or \
-     `--features onnx-dynamic` (load libonnxruntime at runtime)."
-);
-
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -24,13 +12,13 @@ fn main() {
     {
         let server_mode = std::env::args().skip(1).any(|arg| arg == "--server");
         if server_mode {
-            server::main();
+            tiktok_tts_app::run_server();
         } else {
-            desktop::run();
+            tiktok_tts_app::run();
         }
     }
     #[cfg(not(feature = "desktop"))]
     {
-        server::main();
+        tiktok_tts_app::run_server();
     }
 }

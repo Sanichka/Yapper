@@ -210,7 +210,33 @@ The intended mobile path is Tauri's Android target with a runtime-loaded ONNX Ru
 3. Add `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `INTERNET` and
    `WAKE_LOCK` permissions to the generated manifest.
 
-This path is not built or tested in CI yet.
+This path is not built or tested in CI yet. The CI workflow instead builds the default
+feature set for `aarch64`, which downloads the Android ONNX Runtime binary through `ort`
+and produces a debug-signed APK.
+
+## Releases and CI
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the desktop bundles
+(Windows NSIS, macOS DMG, Linux DEB/AppImage) and an Android arm64 APK.
+
+The workflow only builds when the pushed commit message contains the version from
+`Cargo.toml` (for example `Release v0.0.1`) or when a matching `v<version>` tag is pushed.
+`workflow_dispatch` always builds. Tags additionally publish a GitHub release with every
+artifact. The version gate fails early if `Cargo.toml`, `tauri.conf.json`, or the UI
+package versions disagree.
+
+To cut a release:
+
+```bash
+# bump the version in Cargo.toml, tauri.conf.json, ui/package.json and ui/package-lock.json
+git commit -am "Release v0.0.1"
+git push origin main
+git tag -a v0.0.1 -m "Yapper v0.0.1"
+git push origin v0.0.1
+```
+
+The Android artifact is a debug-signed APK for testing; configure a keystore to sign a
+Play Store release. Desktop artifacts are unsigned unless signing secrets are configured.
 
 ## Development
 
