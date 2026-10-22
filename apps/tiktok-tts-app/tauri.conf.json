@@ -4,9 +4,9 @@
   "version": "0.0.1",
   "identifier": "com.sanichka.yapper",
   "build": {
-    "beforeDevCommand": "npm --prefix ui run dev",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm --prefix ui run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "ui/dist"
   },
   "app": {
