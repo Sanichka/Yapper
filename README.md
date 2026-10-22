@@ -80,12 +80,13 @@ npm --prefix apps/tiktok-tts-app/ui run build
 
 ```bash
 cargo install tauri-cli --locked   # once
+cd apps/tiktok-tts-app
 cargo tauri dev                    # development window
 cargo tauri build                  # platform bundles
 ```
 
-Run from the repository root so `models/` is found. The desktop build is the default
-feature set (`desktop` + `onnx`).
+Without the Tauri CLI, `cargo run -p tiktok-tts-app` from the repository root launches the
+same development window. The desktop build is the default feature set (`desktop` + `onnx`).
 
 ## Headless LAN server
 
