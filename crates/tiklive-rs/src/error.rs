@@ -1,0 +1,31 @@
+use thiserror::Error;
+
+pub type Result<T, E = LiveError> = std::result::Result<T, E>;
+
+#[derive(Debug, Error)]
+pub enum LiveError {
+    #[error("user not found: @{0}")]
+    UserNotFound(String),
+    #[error("@{0} is not live right now")]
+    UserOffline(String),
+    #[error("room lookup failed: {0}")]
+    RoomLookup(String),
+    #[error("TikTok did not issue a ttwid cookie (HTTP {status})")]
+    TtwidMissing { status: u16 },
+    #[error("TikTok rate limited the request (HTTP {status})")]
+    RateLimited { status: u16 },
+    #[error("could not open the TikTok webcast socket: {0}")]
+    SocketOpen(String),
+    #[error("websocket error: {0}")]
+    WebSocket(String),
+    #[error("protocol decode error: {0}")]
+    Protocol(String),
+    #[error("reconnect failed after {attempts} attempts: {last}")]
+    ReconnectFailed { attempts: u32, last: String },
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+}

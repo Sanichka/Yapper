@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+**/node_modules
+**/dist
+
+# Tauri
+apps/tiktok-tts-app/gen
+
+# Models and generated assets
+models/
+**/*.onnx
+**/voices.npz
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/

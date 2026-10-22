@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Default window capability for Yapper",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

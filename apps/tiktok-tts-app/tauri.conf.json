@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Yapper",
+  "version": "0.1.0",
+  "identifier": "com.sanichka.yapper",
+  "build": {
+    "beforeDevCommand": "npm --prefix ui run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm --prefix ui run build",
+    "frontendDist": "ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Yapper",
+        "width": 1180,
+        "height": 790,
+        "minWidth": 920,
+        "minHeight": 620,
+        "resizable": true,
+        "center": true,
+        "backgroundColor": "#0b0d12"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "category": "Utility",
+    "shortDescription": "Read TikTok LIVE chat aloud with a local neural voice",
+    "longDescription": "Yapper connects anonymously to a TikTok LIVE stream, filters chat and gifts, and speaks them with the on-device KittenTTS neural voice. It can run as a desktop app or as a LAN server for your phone."
+  }
+}

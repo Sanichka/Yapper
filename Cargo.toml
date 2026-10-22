@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/tiklive-rs", "crates/kittentts-rs", "apps/tiktok-tts-app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT"
+authors = ["Sanichka"]
+
+[workspace.dependencies]
+any_ascii = "0.3.3"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws", "query"] }
+base64 = "0.22"
+bytes = "1"
+flate2 = "1"
+futures-util = "0.3"
+libloading = "0.8"
+npyz = { version = "0.9.1", features = ["npz"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray"] }
+prost = "0.14"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
