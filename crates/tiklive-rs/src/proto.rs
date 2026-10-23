@@ -27,10 +27,10 @@ pub struct PushFrame {
     pub seq_id: u64,
     #[prost(uint64, tag = "2")]
     pub log_id: u64,
-    #[prost(string, tag = "3")]
-    pub service: String,
-    #[prost(string, tag = "4")]
-    pub method: String,
+    #[prost(uint64, tag = "3")]
+    pub service: u64,
+    #[prost(uint64, tag = "4")]
+    pub method: u64,
     #[prost(message, repeated, tag = "5")]
     pub headers: Vec<FrameHeader>,
     #[prost(string, tag = "6")]
@@ -137,8 +137,8 @@ fn frame(payload_type: &str, payload: Vec<u8>) -> PushFrame {
     PushFrame {
         seq_id: 0,
         log_id: 0,
-        service: String::new(),
-        method: String::new(),
+        service: 0,
+        method: 0,
         headers: Vec::new(),
         payload_encoding: "pb".into(),
         payload_type: payload_type.into(),
@@ -147,7 +147,7 @@ fn frame(payload_type: &str, payload: Vec<u8>) -> PushFrame {
 }
 
 /// Joins the room on an open socket (mirrors TikTok's web client).
-pub fn encode_enter_room(room_id: u64, cursor: &str) -> Vec<u8> {
+pub fn encode_enter_room(room_id: u64, cursor: &str, enter_unique_id: u64) -> Vec<u8> {
     #[derive(Clone, PartialEq, ProstMessage)]
     struct EnterRoom {
         #[prost(uint64, tag = "1")]
@@ -158,28 +158,37 @@ pub fn encode_enter_room(room_id: u64, cursor: &str) -> Vec<u8> {
         identity: String,
         #[prost(string, tag = "6")]
         cursor: String,
+        #[prost(uint64, tag = "8")]
+        enter_unique_id: u64,
     }
     let body = EnterRoom {
         room_id,
         live_id: LIVE_ID,
         identity: "audience".into(),
         cursor: cursor.into(),
+        enter_unique_id,
     };
     frame("im_enter_room", body.encode_to_vec()).encode_to_vec()
 }
 
-pub fn encode_heartbeat(room_id: u64) -> Vec<u8> {
+pub fn encode_heartbeat(room_id: u64, send_packet_seq_id: u64) -> Vec<u8> {
     #[derive(Clone, PartialEq, ProstMessage)]
     struct Heartbeat {
         #[prost(uint64, tag = "1")]
         room_id: u64,
+        #[prost(string, tag = "2")]
+        send_packet_seq_id: String,
     }
-    frame("hb", Heartbeat { room_id }.encode_to_vec()).encode_to_vec()
+    let body = Heartbeat {
+        room_id,
+        send_packet_seq_id: send_packet_seq_id.to_string(),
+    };
+    frame("hb", body.encode_to_vec()).encode_to_vec()
 }
 
-/// Acknowledges a message batch. The web client sends `-` as the payload.
-pub fn encode_ack(log_id: u64) -> Vec<u8> {
-    let mut frame = frame("ack", b"-".to_vec());
+/// Acknowledges a message batch with the batch's `internal_ext` cursor.
+pub fn encode_ack(log_id: u64, internal_ext: &str) -> Vec<u8> {
+    let mut frame = frame("ack", internal_ext.as_bytes().to_vec());
     frame.log_id = log_id;
     frame.encode_to_vec()
 }
@@ -696,7 +705,7 @@ mod tests {
 
     #[test]
     fn enter_room_frame_roundtrips() {
-        let bytes = encode_enter_room(123456789, "");
+        let bytes = encode_enter_room(123456789, "", 42);
         let frame = PushFrame::decode(bytes.as_slice()).unwrap();
         assert_eq!(frame.payload_type, "im_enter_room");
         assert_eq!(frame.payload_encoding, "pb");
@@ -711,22 +720,40 @@ mod tests {
             identity: String,
             #[prost(string, tag = "6")]
             cursor: String,
+            #[prost(uint64, tag = "8")]
+            enter_unique_id: u64,
         }
         let body = EnterRoom::decode(frame.payload.as_slice()).unwrap();
         assert_eq!(body.room_id, 123456789);
         assert_eq!(body.live_id, LIVE_ID);
         assert_eq!(body.identity, "audience");
+        assert_eq!(body.enter_unique_id, 42);
+    }
+
+    #[test]
+    fn numeric_service_and_method_decode() {
+        let result = FetchResult {
+            cursor: "token".into(),
+            ..Default::default()
+        };
+        let mut push = frame("msg", result.encode_to_vec());
+        push.service = 8888;
+        push.method = 8;
+        let decoded = decode_socket_frame(&push.encode_to_vec()).unwrap();
+        assert_eq!(decoded.frame.service, 8888);
+        assert_eq!(decoded.frame.method, 8);
+        assert_eq!(decoded.result.unwrap().cursor, "token");
     }
 
     #[test]
     fn heartbeat_and_ack_frames() {
-        let hb = PushFrame::decode(encode_heartbeat(7).as_slice()).unwrap();
+        let hb = PushFrame::decode(encode_heartbeat(7, 3).as_slice()).unwrap();
         assert_eq!(hb.payload_type, "hb");
 
-        let ack = PushFrame::decode(encode_ack(99).as_slice()).unwrap();
+        let ack = PushFrame::decode(encode_ack(99, "cursor").as_slice()).unwrap();
         assert_eq!(ack.payload_type, "ack");
         assert_eq!(ack.log_id, 99);
-        assert_eq!(ack.payload, b"-");
+        assert_eq!(ack.payload, b"cursor");
     }
 
     #[test]

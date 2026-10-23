@@ -27,6 +27,8 @@ pub struct QueueItem {
     pub text: String,
     /// Original chat comment / gift description.
     pub raw: String,
+    /// Resolved spoken language (`en` or `uk`).
+    pub language: String,
     pub priority: Priority,
     /// `chat` or `gift`.
     pub kind: String,
@@ -219,6 +221,7 @@ mod tests {
             unique_id: "u".into(),
             text: "t".into(),
             raw: "t".into(),
+            language: "en".into(),
             priority,
             kind: "chat".into(),
             voice: "Bella".into(),

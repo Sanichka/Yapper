@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use kittentts_rs::language;
 use kittentts_rs::queue::QueueSnapshot;
 use kittentts_rs::text::{FilterReason, TextPipeline, TtsSettings};
 use kittentts_rs::{
     create_engine, wav, wav_bytes, BoundedQueue, EngineStatus, Priority, PushOutcome, QueueItem,
     SynthRequest, TtsEngine, SAMPLE_RATE,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tiklive_rs::{
     normalize_username, ConnectOptions, ConnectionEvent, DisconnectReason, LiveClient, LiveEvent,
     LiveSession, RoomStatus, SessionControl,
@@ -64,10 +65,28 @@ pub struct StatsDto {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppConfigDto {
+    pub queue_capacity: usize,
+    pub auto_connect: bool,
+    pub server_port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfigUpdate {
+    pub queue_capacity: Option<usize>,
+    pub auto_connect: Option<bool>,
+    pub server_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppStateDto {
     pub connection: ConnectionState,
     pub engine: EngineStatus,
+    pub edge_engine: EngineStatus,
     pub settings: TtsSettings,
+    pub config: AppConfigDto,
     pub queue: QueueSnapshot,
     pub paused: bool,
     pub stats: StatsDto,
@@ -111,6 +130,7 @@ pub struct Core {
     config_path: PathBuf,
     config: Mutex<PersistedConfig>,
     engine: RwLock<Arc<dyn TtsEngine>>,
+    edge_engine: Arc<dyn TtsEngine>,
     pub event_tx: broadcast::Sender<ServerEvent>,
     queue: Mutex<BoundedQueue>,
     pipeline: TextPipeline,
@@ -138,6 +158,7 @@ impl Core {
         model_override: Option<PathBuf>,
         server_mode: bool,
     ) -> Result<Arc<Self>, String> {
+        crate::edge::ensure_default_crypto_provider();
         let persisted = PersistedConfig::load(&config_path);
         let queue_capacity = persisted.queue_capacity.clamp(1, 500);
         let configured_model = persisted.model_dir.clone();
@@ -154,6 +175,7 @@ impl Core {
             config_path,
             config: Mutex::new(persisted),
             engine: RwLock::new(engine),
+            edge_engine: Arc::new(crate::edge::EdgeEngine),
             event_tx,
             queue: Mutex::new(BoundedQueue::new(queue_capacity)),
             pipeline: TextPipeline::new(),
@@ -207,7 +229,9 @@ impl Core {
         AppStateDto {
             connection,
             engine,
+            edge_engine: self.edge_engine.status(),
             settings,
+            config: self.app_config(),
             paused: self.paused.load(Ordering::Relaxed),
             stats: StatsDto {
                 received: self.stats_received.load(Ordering::Relaxed),
@@ -269,6 +293,21 @@ impl Core {
             .unwrap_or_default()
     }
 
+    pub fn app_config(&self) -> AppConfigDto {
+        self.config
+            .lock()
+            .map(|c| AppConfigDto {
+                queue_capacity: c.queue_capacity,
+                auto_connect: c.auto_connect,
+                server_port: c.server_port,
+            })
+            .unwrap_or(AppConfigDto {
+                queue_capacity: kittentts_rs::MAX_QUEUE_SIZE,
+                auto_connect: false,
+                server_port: config::DEFAULT_PORT,
+            })
+    }
+
     pub fn username(&self) -> String {
         self.config
             .lock()
@@ -289,7 +328,8 @@ impl Core {
 
     pub fn update_settings(&self, settings: TtsSettings) -> Result<(), String> {
         let mut next = settings;
-        next.voice = next.voice.trim().to_string();
+        next.language = language::normalize_language(&next.language).to_string();
+        next.voice = language::voice_for_language(&next.language, &next.voice);
         if next.voice.is_empty() {
             next.voice = "Bella".into();
         }
@@ -318,6 +358,42 @@ impl Core {
             config.settings = next;
         }
         self.pipeline.reset_cooldowns();
+        self.save_config();
+        self.emit_state();
+        Ok(())
+    }
+
+    pub fn update_app_config(&self, update: AppConfigUpdate) -> Result<(), String> {
+        if let Some(capacity) = update.queue_capacity {
+            if !(1..=500).contains(&capacity) {
+                return Err("Queue capacity must be between 1 and 500".into());
+            }
+        }
+        if update.server_port == Some(0) {
+            return Err("Server port must be between 1 and 65535".into());
+        }
+
+        {
+            let mut config = self
+                .config
+                .lock()
+                .map_err(|_| "config lock was poisoned".to_string())?;
+            if let Some(capacity) = update.queue_capacity {
+                config.queue_capacity = capacity;
+            }
+            if let Some(auto_connect) = update.auto_connect {
+                config.auto_connect = auto_connect;
+            }
+            if let Some(port) = update.server_port {
+                config.server_port = port;
+            }
+        }
+
+        if let Some(capacity) = update.queue_capacity {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.set_capacity(capacity);
+            }
+        }
         self.save_config();
         self.emit_state();
         Ok(())
@@ -548,6 +624,7 @@ impl Core {
                             prepared.spoken,
                             prepared.raw,
                             &settings,
+                            &prepared.language,
                         );
                     }
                     Err(reason) => {
@@ -595,6 +672,7 @@ impl Core {
                             prepared.spoken,
                             prepared.raw,
                             &settings,
+                            &prepared.language,
                         );
                     }
                     Err(reason) => {
@@ -642,6 +720,7 @@ impl Core {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_item(
         &self,
         kind: &str,
@@ -651,7 +730,9 @@ impl Core {
         text: String,
         raw: String,
         settings: &TtsSettings,
+        language: &str,
     ) {
+        let voice = language::voice_for_language(language, &settings.voice);
         let item = {
             let mut queue = match self.queue.lock() {
                 Ok(queue) => queue,
@@ -663,9 +744,10 @@ impl Core {
                 unique_id,
                 text,
                 raw: raw.clone(),
+                language: language.into(),
                 priority,
                 kind: kind.into(),
-                voice: settings.voice.clone(),
+                voice,
                 speed: settings.speed,
                 created_at: now_ms(),
             }
@@ -681,9 +763,10 @@ impl Core {
                 unique_id: String::new(),
                 text: String::new(),
                 raw: raw.clone(),
+                language: language.into(),
                 priority,
                 kind: kind.into(),
-                voice: settings.voice.clone(),
+                voice: language::voice_for_language(language, &settings.voice),
                 speed: settings.speed,
                 created_at: now_ms(),
             }));
@@ -758,6 +841,7 @@ impl Core {
             return Err("Nothing to speak".into());
         }
         let settings = self.settings();
+        let language = language::resolve_language(&settings.language, text);
         self.push_item(
             "test",
             Priority::High,
@@ -766,6 +850,7 @@ impl Core {
             text.to_string(),
             text.to_string(),
             &settings,
+            language,
         );
         Ok(())
     }
@@ -791,11 +876,15 @@ impl Core {
             };
             self.emit_state();
 
-            let engine = self
-                .engine
-                .read()
-                .map(|engine| engine.clone())
-                .unwrap_or_else(|_| Arc::new(kittentts_rs::MockEngine::new()));
+            let engine = if item.language == language::UKRAINIAN {
+                self.edge_engine.clone()
+            } else {
+                self.engine
+                    .read()
+                    .map(|engine| engine.clone())
+                    .unwrap_or_else(|_| Arc::new(kittentts_rs::MockEngine::new()))
+            };
+            let sample_rate = engine.sample_rate();
             let request = SynthRequest {
                 text: item.text.clone(),
                 voice: item.voice.clone(),
@@ -807,8 +896,8 @@ impl Core {
 
             match result {
                 Ok(Ok(samples)) if !skip => {
-                    let duration_ms = wav::duration_ms(samples.len(), SAMPLE_RATE);
-                    let bytes = wav_bytes(&samples, SAMPLE_RATE);
+                    let duration_ms = wav::duration_ms(samples.len(), sample_rate);
+                    let bytes = wav_bytes(&samples, sample_rate);
                     let audio = base64::engine::general_purpose::STANDARD.encode(bytes);
                     let seq = self.utterance_seq.fetch_add(1, Ordering::SeqCst) + 1;
                     self.active_seq.store(seq, Ordering::SeqCst);
@@ -875,4 +964,71 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("yapper-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (dir.join("config.json"), dir)
+    }
+
+    #[test]
+    fn updates_app_config_and_queue_capacity() {
+        let (path, dir) = temp_config("update");
+        let core = Core::new(path.clone(), Some(dir.join("missing-model")), false).unwrap();
+
+        core.update_app_config(AppConfigUpdate {
+            queue_capacity: Some(7),
+            auto_connect: Some(true),
+            server_port: Some(9099),
+        })
+        .unwrap();
+
+        let state = core.state();
+        assert_eq!(state.config.queue_capacity, 7);
+        assert!(state.config.auto_connect);
+        assert_eq!(state.config.server_port, 9099);
+        assert_eq!(state.queue.capacity, 7);
+
+        let persisted = PersistedConfig::load(&path);
+        assert_eq!(persisted.queue_capacity, 7);
+        assert!(persisted.auto_connect);
+        assert_eq!(persisted.server_port, 9099);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_invalid_app_config() {
+        let (path, dir) = temp_config("invalid");
+        let core = Core::new(path, Some(dir.join("missing-model")), false).unwrap();
+
+        assert!(core
+            .update_app_config(AppConfigUpdate {
+                queue_capacity: Some(0),
+                auto_connect: None,
+                server_port: None,
+            })
+            .is_err());
+        assert!(core
+            .update_app_config(AppConfigUpdate {
+                queue_capacity: Some(501),
+                auto_connect: None,
+                server_port: None,
+            })
+            .is_err());
+        assert!(core
+            .update_app_config(AppConfigUpdate {
+                queue_capacity: None,
+                auto_connect: None,
+                server_port: Some(0),
+            })
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -216,6 +216,32 @@ mod tests {
         let loaded = PersistedConfig::load(&path);
         assert_eq!(loaded.username, "creator");
         assert_eq!(loaded.settings.voice, "Luna");
+        assert_eq!(loaded.settings.language, "auto");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_config_without_language_loads_with_defaults() {
+        let raw = r#"{
+          "username": "creator",
+          "autoConnect": false,
+          "serverPort": 8787,
+          "queueCapacity": 15,
+          "modelDir": null,
+          "settings": {
+            "voice": "Bella",
+            "speed": 1.0,
+            "template": "{user} says: {text}",
+            "giftTemplate": "{user} sent {count} {gift}",
+            "readGifts": true,
+            "minGiftDiamonds": 1,
+            "maxLen": 150,
+            "cooldownSecs": 3,
+            "transliterate": true,
+            "blacklist": []
+          }
+        }"#;
+        let config: PersistedConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(config.settings.language, "auto");
     }
 }

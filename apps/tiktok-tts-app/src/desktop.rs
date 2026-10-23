@@ -6,7 +6,7 @@ use kittentts_rs::text::TtsSettings;
 use tauri::{Emitter, Manager, State};
 
 use crate::config;
-use crate::core::{AppStateDto, Core};
+use crate::core::{AppConfigUpdate, AppStateDto, Core};
 
 type AppCore<'a> = State<'a, Arc<Core>>;
 
@@ -31,6 +31,12 @@ fn disconnect(core: AppCore<'_>) -> AppStateDto {
 #[tauri::command]
 fn update_settings(core: AppCore<'_>, settings: TtsSettings) -> Result<AppStateDto, String> {
     core.update_settings(settings)?;
+    Ok(core.state())
+}
+
+#[tauri::command]
+fn update_app_config(core: AppCore<'_>, config: AppConfigUpdate) -> Result<AppStateDto, String> {
+    core.update_app_config(config)?;
     Ok(core.state())
 }
 
@@ -111,6 +117,7 @@ pub fn run() {
             connect,
             disconnect,
             update_settings,
+            update_app_config,
             speak,
             skip,
             clear_queue,

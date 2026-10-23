@@ -1,14 +1,18 @@
-//! Plain HTTPS calls to `tiktok.com`. None of these require request signing.
+//! HTTPS calls to TikTok plus the EulerStream signed-WebSocket handshake.
 
 use std::sync::{Arc, Mutex};
 
+use prost::Message;
 use reqwest::cookie::CookieStore;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, REFERER};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER, SET_COOKIE,
+};
 use reqwest::Url;
 use serde::Deserialize;
 
 use crate::error::{LiveError, Result};
 use crate::events::{GiftInfo, RoomOwner, RoomStatus};
+use crate::proto::FetchResult;
 
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
 
@@ -24,10 +28,15 @@ fn find_tiktok_handle(input: &str) -> Option<&str> {
     let lower = input.to_ascii_lowercase();
     let at = lower.find("tiktok.com/@")?;
     let rest = &input[at + "tiktok.com/@".len()..];
-    let end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     (!rest[..end].is_empty()).then_some(&rest[..end])
+}
+
+/// A short-lived signed WebSocket handshake for one room.
+pub struct SignedSocket {
+    pub push_server: String,
+    pub cookie: String,
+    pub initial: FetchResult,
 }
 
 /// A signed-out TikTok web client: page cookies, room lookup and gift catalog.
@@ -73,8 +82,8 @@ impl TikTokWeb {
         &self.user_agent
     }
 
-    /// The anonymous `ttwid` device cookie the webcast WebSocket requires.
-    /// TikTok issues one on any plain page load; cached unless `refresh`.
+    /// An anonymous TikTok device cookie, used by the unsigned fallback path.
+    /// Cached unless `refresh`.
     pub async fn ttwid(&self, refresh: bool) -> Result<String> {
         if !refresh {
             if let Some(cached) = self.cached_ttwid.lock().expect("ttwid cache").as_ref() {
@@ -82,13 +91,113 @@ impl TikTokWeb {
             }
         }
 
-        let res = self.client.get("https://www.tiktok.com/").send().await?;
-        let status = res.status().as_u16();
-        let url = Url::parse("https://www.tiktok.com/")?;
+        let _res = self
+            .client
+            .get("https://www.tiktok.com/live")
+            .send()
+            .await?;
+        let url = Url::parse("https://www.tiktok.com/live")?;
         let cookie = self
             .jar
             .cookies(&url)
             .and_then(|value| cookie_value(&value, "ttwid"));
+
+        let ttwid = match cookie {
+            Some(cookie) => cookie,
+            None => self.register_ttwid().await?,
+        };
+
+        *self.cached_ttwid.lock().expect("ttwid cache") = Some(ttwid.clone());
+        Ok(ttwid)
+    }
+
+    /// TikTok's webcast socket now requires a request signature. EulerStream
+    /// returns the signed route parameters, the initial event batch and the
+    /// anonymous cookie accepted by the signed socket.
+    pub async fn signed_socket(&self, room_id: &str) -> Result<SignedSocket> {
+        let base = std::env::var("SIGN_API_URL")
+            .unwrap_or_else(|_| "https://api.eulerstream.com".to_string());
+        let endpoint = format!(
+            "{}/webcast/rooms/{room_id}/connect",
+            base.trim_end_matches('/')
+        );
+        let mut request = self
+            .client
+            .get(endpoint)
+            .query(&[
+                ("client", "ttlive-rs"),
+                ("user_agent", self.user_agent.as_str()),
+                ("client_enter", "true"),
+                ("platform", "web"),
+            ])
+            .header(ACCEPT, "application/protobuf,application/json")
+            .header("User-Agent", "tiktok-live-connector/2.5.0 win32");
+        if let Ok(api_key) = std::env::var("SIGN_API_KEY") {
+            if !api_key.is_empty() {
+                request = request.header("x-api-key", api_key);
+            }
+        }
+        let res = request.send().await?;
+
+        let status = res.status().as_u16();
+        let cookie = res
+            .headers()
+            .get("x-set-tt-cookie")
+            .and_then(|value| value.to_str().ok())
+            .map(decode_percent);
+        let bytes = res.bytes().await?;
+
+        if status != 200 {
+            let detail = String::from_utf8_lossy(&bytes);
+            return Err(if status == 429 {
+                LiveError::RateLimited { status }
+            } else {
+                LiveError::Signing(format!("HTTP {status}: {detail}"))
+            });
+        }
+
+        let Some(cookie) = cookie.filter(|cookie| !cookie.is_empty()) else {
+            return Err(LiveError::Signing("response had no x-set-tt-cookie".into()));
+        };
+        let initial = FetchResult::decode(bytes.as_ref())
+            .map_err(|e| LiveError::Signing(format!("invalid protobuf response: {e}")))?;
+        if initial.push_server.is_empty() {
+            return Err(LiveError::Signing("response had no push server".into()));
+        }
+
+        Ok(SignedSocket {
+            push_server: initial.push_server.clone(),
+            cookie,
+            initial,
+        })
+    }
+
+    /// TikTok's page can be replaced by a WAF challenge that never sets
+    /// `ttwid`. The union registration endpoint still issues one directly.
+    async fn register_ttwid(&self) -> Result<String> {
+        let body = serde_json::json!({
+            "region": "cn",
+            "aid": 1768,
+            "needFid": false,
+            "service": "www.tiktok.com",
+            "migrate_info": { "ticket": "", "source": "node" },
+            "cbUrlProtocol": "https",
+            "union": true
+        });
+        let res = self
+            .client
+            .post("https://ttwid.bytedance.com/ttwid/union/register/")
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        let cookie = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .find_map(|header| cookie_value(header, "ttwid"));
 
         let Some(ttwid) = cookie else {
             return Err(if status == 429 {
@@ -97,8 +206,6 @@ impl TikTokWeb {
                 LiveError::TtwidMissing { status }
             });
         };
-
-        *self.cached_ttwid.lock().expect("ttwid cache") = Some(ttwid.clone());
         Ok(ttwid)
     }
 
@@ -232,6 +339,26 @@ fn cookie_value(header: &HeaderValue, name: &str) -> Option<String> {
         let (key, value) = pair.trim().split_once('=')?;
         (key == name).then(|| value.to_string())
     })
+}
+
+fn decode_percent(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(hex) = value.get(i + 1..i + 3) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // Smaller first: the URL is for previews, not re-streaming.

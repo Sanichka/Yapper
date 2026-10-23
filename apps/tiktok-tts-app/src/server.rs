@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config;
-use crate::core::{AppStateDto, Core, ServerEvent};
+use crate::core::{AppConfigUpdate, AppStateDto, Core, ServerEvent};
 
 #[derive(Debug)]
 struct ApiError(StatusCode, String);
@@ -42,6 +42,7 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/connect", post(connect))
         .route("/disconnect", post(disconnect))
         .route("/settings", post(update_settings))
+        .route("/config", post(update_app_config))
         .route("/speak", post(speak))
         .route("/queue/skip", post(skip))
         .route("/queue/clear", post(clear))
@@ -92,6 +93,14 @@ async fn update_settings(
     Json(settings): Json<TtsSettings>,
 ) -> ApiResult {
     core.update_settings(settings).map_err(ApiError::bad)?;
+    Ok(Json(core.state()))
+}
+
+async fn update_app_config(
+    State(core): State<Arc<Core>>,
+    Json(config): Json<AppConfigUpdate>,
+) -> ApiResult {
+    core.update_app_config(config).map_err(ApiError::bad)?;
     Ok(Json(core.state()))
 }
 

@@ -14,6 +14,8 @@ pub enum LiveError {
     TtwidMissing { status: u16 },
     #[error("TikTok rate limited the request (HTTP {status})")]
     RateLimited { status: u16 },
+    #[error("could not sign the TikTok webcast connection: {0}")]
+    Signing(String),
     #[error("could not open the TikTok webcast socket: {0}")]
     SocketOpen(String),
     #[error("websocket error: {0}")]

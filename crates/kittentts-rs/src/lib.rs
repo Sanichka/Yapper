@@ -22,6 +22,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod language;
 pub mod phonemes;
 pub mod queue;
 pub mod text;

@@ -33,7 +33,7 @@ export interface ConnectionState {
 }
 
 export interface EngineStatus {
-  kind: "onnx" | "mock";
+  kind: "onnx" | "mock" | "edge";
   model: string;
   sampleRate: number;
   voices: string[];
@@ -41,6 +41,7 @@ export interface EngineStatus {
 }
 
 export interface TtsSettings {
+  language: string;
   voice: string;
   speed: number;
   template: string;
@@ -59,6 +60,7 @@ export interface QueueItem {
   uniqueId: string;
   text: string;
   raw: string;
+  language: string;
   priority: "high" | "normal";
   kind: string;
   voice: string;
@@ -73,6 +75,12 @@ export interface QueueSnapshot {
   capacity: number;
 }
 
+export interface AppConfig {
+  queueCapacity: number;
+  autoConnect: boolean;
+  serverPort: number;
+}
+
 export interface Stats {
   received: number;
   spoken: number;
@@ -83,7 +91,9 @@ export interface Stats {
 export interface AppStateDto {
   connection: ConnectionState;
   engine: EngineStatus;
+  edgeEngine: EngineStatus;
   settings: TtsSettings;
+  config: AppConfig;
   queue: QueueSnapshot;
   paused: boolean;
   stats: Stats;

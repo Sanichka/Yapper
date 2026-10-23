@@ -4,6 +4,7 @@ mod config;
 mod core;
 #[cfg(feature = "desktop")]
 mod desktop;
+mod edge;
 mod server;
 
 #[cfg(all(not(feature = "onnx"), not(feature = "onnx-dynamic")))]

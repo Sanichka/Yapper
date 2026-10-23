@@ -20,6 +20,8 @@ pub enum TtsError {
     Ort(String),
     #[error("inference produced an empty waveform")]
     EmptyAudio,
+    #[error("speech service failed: {0}")]
+    Service(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

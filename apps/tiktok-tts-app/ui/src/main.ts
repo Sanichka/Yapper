@@ -3,6 +3,7 @@ import { Player } from "./player";
 import { Transport } from "./transport";
 import type {
   ActivityEvent,
+  AppConfig,
   AppStateDto,
   ConnStatus,
   ServerEvent,
@@ -20,6 +21,11 @@ const FALLBACK_VOICES = [
   "Leo",
 ];
 
+const UKRAINIAN_VOICES = ["uk-UA-PolinaNeural", "uk-UA-OstapNeural"];
+const LANGUAGE_AUTO = "auto";
+const LANGUAGE_EN = "en";
+const LANGUAGE_UK = "uk";
+
 interface FeedEntry extends ActivityEvent {
   at: number;
 }
@@ -34,6 +40,10 @@ let settingsDirty = false;
 let settingsRevision = 0;
 let saveTimer: number | undefined;
 let saving = false;
+let appConfigDirty = false;
+let appConfigRevision = 0;
+let appConfigTimer: number | undefined;
+let savingAppConfig = false;
 let playing: { id: number; durationMs: number } | null = null;
 let currentSeq: number | null = null;
 let lastStatus: ConnStatus | null = null;
@@ -145,6 +155,7 @@ function render(): void {
   renderConnection();
   renderVoice();
   renderSettings(false);
+  renderAppSettings(false);
   renderNow();
   renderQueue();
   renderStats();
@@ -227,40 +238,74 @@ function renderConnection(): void {
 
 function renderVoice(): void {
   if (!state) return;
-  const engine = state.engine;
+  const language =
+    settingsDirty
+      ? ($<HTMLSelectElement>("#language").value as string)
+      : state.settings.language;
+
+  const engine = language === LANGUAGE_UK ? state.edgeEngine : state.engine;
   const badge = $("#engine-badge");
-  badge.textContent = engine.kind === "onnx" ? "ONNX" : "MOCK";
-  badge.className = `badge ${engine.kind === "onnx" ? "badge-mint" : "badge-amber"}`;
+  const label = engine.kind === "onnx" ? "ONNX" : engine.kind === "edge" ? "EDGE" : "MOCK";
+  const badgeClass =
+    engine.kind === "onnx"
+      ? "badge-mint"
+      : engine.kind === "edge"
+        ? "badge-blue"
+        : "badge-amber";
+  badge.textContent = label;
+  badge.className = `badge ${badgeClass}`;
   badge.title = engine.model;
 
   $("#engine-line").textContent =
     engine.kind === "onnx"
       ? `${engine.model} · ${engine.sampleRate / 1000} kHz · ${engine.threads} threads`
-      : "Tone test engine — model not loaded";
+      : engine.kind === "edge"
+        ? `${engine.model} · ${engine.sampleRate / 1000} kHz`
+        : "Tone test engine — model not loaded";
 
   const note = $("#engine-note");
-  if (state.engineNote) {
+  if (state.engineNote && language !== LANGUAGE_UK) {
     note.textContent = state.engineNote;
     note.classList.remove("hidden");
   } else {
     note.classList.add("hidden");
   }
 
+  const langNote = $("#language-note");
+  if (language === LANGUAGE_UK) {
+    langNote.textContent =
+      "Ukrainian is synthesized by Microsoft Edge online — an internet connection is required.";
+    langNote.classList.remove("hidden");
+  } else if (language === LANGUAGE_AUTO) {
+    langNote.textContent =
+      "English uses the local Kitten voice; Cyrillic messages are spoken by a Ukrainian Edge voice online.";
+    langNote.classList.remove("hidden");
+  } else {
+    langNote.classList.add("hidden");
+  }
+
   const select = $<HTMLSelectElement>("#voice");
-  const voices = (engine.voices.length ? engine.voices : FALLBACK_VOICES).slice();
-  const current = settingsDirty ? select.value : state.settings.voice;
-  if (current && !voices.includes(current)) voices.unshift(current);
-  if (document.activeElement !== select && !settingsDirty) {
-    const signature = voices.join("|");
-    if (select.dataset.signature !== signature) {
-      select.innerHTML = voices
-        .map(
-          (voice) =>
-            `<option value="${esc(voice)}">${esc(displayVoice(voice))}</option>`,
-        )
-        .join("");
-      select.dataset.signature = signature;
-    }
+  const voices =
+    language === LANGUAGE_UK
+      ? UKRAINIAN_VOICES.slice()
+      : (state.engine.voices.length
+          ? state.engine.voices
+          : FALLBACK_VOICES
+        ).slice();
+  const signature = `${language}|${voices.join("|")}`;
+  if (select.dataset.signature !== signature) {
+    select.innerHTML = voices
+      .map(
+        (voice) =>
+          `<option value="${esc(voice)}">${esc(displayVoice(voice))}</option>`,
+      )
+      .join("");
+    select.dataset.signature = signature;
+  }
+  if (!voices.includes(select.value)) {
+    select.value = voices[0];
+  }
+  if (!settingsDirty && document.activeElement !== select) {
     select.value = state.settings.voice;
   }
 
@@ -277,6 +322,7 @@ function renderSettings(force: boolean): void {
   if (!state) return;
   if (settingsDirty && !force) return;
   const settings = state.settings;
+  setValue("#language", settings.language);
   setValue("#template", settings.template);
   setValue("#gift-template", settings.giftTemplate);
   setValue("#max-len", String(settings.maxLen));
@@ -287,6 +333,24 @@ function renderSettings(force: boolean): void {
   $<HTMLInputElement>("#transliterate").checked = settings.transliterate;
   if (force) {
     $("#save-hint").textContent = "Saved";
+  }
+}
+
+function renderAppSettings(force: boolean): void {
+  if (!state) return;
+  if (appConfigDirty && !force) return;
+  setValue("#queue-capacity", String(state.config.queueCapacity));
+  setValue("#server-port", String(state.config.serverPort));
+  const autoConnect = $<HTMLInputElement>("#auto-connect");
+  if (document.activeElement !== autoConnect) {
+    autoConnect.checked = state.config.autoConnect;
+  }
+  $("#server-port-field").classList.toggle("hidden", !state.serverMode);
+  $("#app-settings-note").textContent = state.serverMode
+    ? "Auto-connect uses the last saved username. Server port changes apply after restarting server mode."
+    : "Auto-connect uses the last saved username. Queue capacity applies immediately.";
+  if (force) {
+    $("#app-save-hint").textContent = "Saved";
   }
 }
 
@@ -442,13 +506,26 @@ function bind(): void {
   });
 
   const settingsSelector =
-    "#voice, #speed, #template, #gift-template, #max-len, #cooldown, #min-gift, #blacklist, #read-gifts, #transliterate";
+    "#language, #voice, #speed, #template, #gift-template, #max-len, #cooldown, #min-gift, #blacklist, #read-gifts, #transliterate";
   document.querySelectorAll(settingsSelector).forEach((element) => {
     element.addEventListener("input", () => {
       if (element.id === "speed") updateSpeedLabel();
       markSettingsDirty();
     });
-    element.addEventListener("change", () => markSettingsDirty());
+    element.addEventListener("change", () => {
+      if (element.id === "language") {
+        markSettingsDirty();
+        renderVoice();
+      } else {
+        markSettingsDirty();
+      }
+    });
+  });
+
+  const appConfigSelector = "#queue-capacity, #server-port, #auto-connect";
+  document.querySelectorAll(appConfigSelector).forEach((element) => {
+    element.addEventListener("input", markAppConfigDirty);
+    element.addEventListener("change", markAppConfigDirty);
   });
 
   document.addEventListener(
@@ -550,6 +627,8 @@ async function saveSettings(): Promise<void> {
     } else {
       window.setTimeout(() => void saveSettings(), 200);
     }
+    renderVoice();
+    renderSettings(false);
     renderNow();
     renderQueue();
     renderStats();
@@ -561,11 +640,67 @@ async function saveSettings(): Promise<void> {
   }
 }
 
+function markAppConfigDirty(): void {
+  appConfigDirty = true;
+  appConfigRevision += 1;
+  $("#app-save-hint").textContent = "Saving…";
+  if (appConfigTimer) window.clearTimeout(appConfigTimer);
+  appConfigTimer = window.setTimeout(() => void saveAppConfig(), 650);
+}
+
+async function saveAppConfig(): Promise<void> {
+  if (!state) return;
+  if (savingAppConfig) return;
+  savingAppConfig = true;
+  const revision = appConfigRevision;
+  try {
+    const config = collectAppConfig();
+    const next = await transport.call<AppStateDto>("update_app_config", {
+      config,
+    });
+    state = next;
+    if (revision === appConfigRevision) {
+      appConfigDirty = false;
+      $("#app-save-hint").textContent = "Saved";
+    } else {
+      window.setTimeout(() => void saveAppConfig(), 200);
+    }
+    renderAppSettings(false);
+    renderQueue();
+  } catch (error) {
+    toast(`Could not save app settings: ${message(error)}`, "error");
+    $("#app-save-hint").textContent = "Not saved";
+  } finally {
+    savingAppConfig = false;
+  }
+}
+
+function collectAppConfig(): AppConfig {
+  const current = state?.config;
+  const queueCapacity = Number($<HTMLInputElement>("#queue-capacity").value);
+  const serverPort = Number($<HTMLInputElement>("#server-port").value);
+  return {
+    queueCapacity: clamp(
+      Math.round(queueCapacity) || current?.queueCapacity || 15,
+      1,
+      500,
+    ),
+    autoConnect: $<HTMLInputElement>("#auto-connect").checked,
+    serverPort: clamp(
+      Math.round(serverPort) || current?.serverPort || 8787,
+      1,
+      65535,
+    ),
+  };
+}
+
 function collectSettings(): TtsSettings {
   const current = state?.settings;
+  const language = $<HTMLSelectElement>("#language").value || "auto";
   const voice = $<HTMLSelectElement>("#voice").value;
   const speed = Number($<HTMLInputElement>("#speed").value);
   return {
+    language,
     voice: voice || current?.voice || "Bella",
     speed: clamp(speed, 0.5, 2),
     template: $<HTMLInputElement>("#template").value,
@@ -629,6 +764,11 @@ function setValue(selector: string, value: string): void {
 }
 
 function displayVoice(voice: string): string {
+  if (voice.startsWith("uk-UA-")) {
+    return voice
+      .replace(/^uk-UA-(\w+)Neural$/, "Polina/Ostap ($1)")
+      .replace(/^uk-UA-/, "Ukrainian ");
+  }
   return voice
     .replace(/^expr-voice-(\d)-([fm])$/i, "Voice $1$2")
     .replace(/^kitten-/, "");
@@ -754,6 +894,14 @@ function shell(): string {
         </div>
         <p id="engine-line" class="hint engine-line"></p>
         <div class="voice-grid">
+          <label class="field field-wide">
+            <span class="field-label">Spoken language</span>
+            <select id="language" class="select">
+              <option value="auto">Auto (English / Ukrainian)</option>
+              <option value="en">English — local</option>
+              <option value="uk">Ukrainian — online</option>
+            </select>
+          </label>
           <label class="field">
             <span class="field-label">Voice</span>
             <select id="voice" class="select"></select>
@@ -763,6 +911,7 @@ function shell(): string {
             <input id="speed" class="range" type="range" min="0.5" max="2" step="0.05" value="1">
           </label>
         </div>
+        <p id="language-note" class="note hidden"></p>
         <p id="engine-note" class="note hidden"></p>
         <form id="test-form" class="test-form">
           <input id="test-text" class="input" placeholder="Test the voice…" maxlength="150">
@@ -806,6 +955,27 @@ function shell(): string {
             <span class="field-label">Blacklist words</span>
             <textarea id="blacklist" class="input textarea" rows="2" placeholder="one per line"></textarea>
           </label>
+        </div>
+      </details>
+
+      <details class="card filters app-settings" id="app-settings">
+        <summary class="card-head filters-summary">
+          <h2>App settings</h2>
+          <span id="app-save-hint" class="hint">Saved</span>
+        </summary>
+        <div class="filters-body">
+          <div class="grid-2">
+            <label class="field">
+              <span class="field-label">Queue capacity</span>
+              <input id="queue-capacity" type="number" min="1" max="500" class="input">
+            </label>
+            <label class="field" id="server-port-field">
+              <span class="field-label">Server port</span>
+              <input id="server-port" type="number" min="1" max="65535" class="input">
+            </label>
+          </div>
+          <label class="check"><input id="auto-connect" type="checkbox"> Connect automatically on launch</label>
+          <p class="hint" id="app-settings-note">Auto-connect uses the last saved username. Queue capacity applies immediately.</p>
         </div>
       </details>
     </aside>

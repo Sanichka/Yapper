@@ -2,17 +2,22 @@
 
 TikTok LIVE chat and gifts, spoken out loud in a local neural voice.
 
-Yapper connects anonymously to a TikTok LIVE stream (no login, no API keys), filters and
-cleans chat messages, and runs **KittenTTS** locally through ONNX Runtime. The same Rust
-core powers a desktop app (Tauri), a headless LAN server, and a browser UI — no Python,
-Node.js or cloud service is needed at runtime.
+Yapper connects to a TikTok LIVE stream without a TikTok login, filters and cleans chat
+messages, and runs **KittenTTS** locally through ONNX Runtime. The same Rust core powers a
+desktop app (Tauri), a headless LAN server, and a browser UI. Live connections use
+EulerStream's public endpoint for the required WebSocket signature; no Python or Node.js is
+needed at runtime.
 
 ## Features
 
-- **Anonymous TikTok LIVE client** — resolves the room, fetches chat, decodes protobuf
-  messages (`WebcastChatMessage`, gifts, likes, members, follows, shares).
+- **Login-free TikTok LIVE client** — resolves the room, signs the WebSocket via
+  EulerStream, fetches chat, and decodes protobuf messages (`WebcastChatMessage`, gifts,
+  likes, members, follows, shares).
 - **Local neural TTS** — KittenTTS mini 0.8 ONNX, 24 kHz, eight expressive voices,
   adjustable speed, CPU inference.
+- **Spoken language** — choose `auto` (English / Ukrainian), English (local
+  KittenTTS), or Ukrainian (Microsoft Edge online). Chat is always shown in its
+  original script; only the spoken text is transliterated when English is active.
 - **Readable chat** — emote/mention stripping, URL and repeat collapsing, blacklist,
   transliteration, per-user cooldown, length limit, `{user}` / `{text}` templates.
 - **Gift announcements** — reads gift streaks with `{user}`, `{gift}`, `{count}`,
@@ -68,6 +73,22 @@ Yapper searches, in order: `YAPPER_MODEL_DIR`, the `modelDir` value in the confi
 `<data dir>/models/kitten-tts-mini-0.8`, `./models/kitten-tts-mini-0.8`, `./models`, and
 next to the executable. Without a model it falls back to a quiet test tone so the UI and
 chat flow can still be exercised.
+
+### Spoken language
+
+KittenTTS 0.8 only speaks English. The **Spoken language** setting chooses how chat is
+voiced:
+
+| Setting | Behavior |
+| --- | --- |
+| `auto` (default) | Latin messages use the local Kitten voice; Cyrillic messages are spoken by a Ukrainian Edge voice. |
+| `en` | Everything is spoken by the local Kitten voice (non-Latin scripts are transliterated for speech). |
+| `uk` | Everything is spoken by a Microsoft Edge Ukrainian neural voice (`Polina` / `Ostap`) over the internet — no API key, no login. |
+
+Chat is always displayed in its original script; transliteration only ever affects the
+spoken text when English is active. Ukrainian voices require a working internet
+connection. Edge voices are provided by Microsoft's public Read Aloud endpoint, so
+treat them as best-effort.
 
 ## Build the UI
 
@@ -141,6 +162,7 @@ All responses are the same application state object the UI renders.
 | `POST` | `/api/connect` | `{"username":"creator"}` |
 | `POST` | `/api/disconnect` | — |
 | `POST` | `/api/settings` | `TtsSettings` JSON |
+| `POST` | `/api/config` | `{"queueCapacity":15,"autoConnect":false,"serverPort":8787}` |
 | `POST` | `/api/speak` | `{"text":"Hello"}` |
 | `POST` | `/api/queue/skip` | — |
 | `POST` | `/api/queue/clear` | — |
@@ -157,6 +179,7 @@ Settings JSON (all fields optional when omitted by clients):
 
 ```json
 {
+  "language": "auto",
   "voice": "Bella",
   "speed": 1.0,
   "template": "{user} says: {text}",
@@ -172,7 +195,9 @@ Settings JSON (all fields optional when omitted by clients):
 
 ## Configuration
 
-Settings, the last username and server port live in `config.json` in the data directory.
+Settings, the last username, queue capacity, auto-connect and server port live in
+`config.json` in the data directory. Queue capacity and auto-connect can be changed live
+from **App settings** in the UI; the server port applies the next time server mode starts.
 The file is written atomically and can be edited while Yapper is stopped:
 
 ```json
@@ -183,6 +208,7 @@ The file is written atomically and can be edited while Yapper is stopped:
   "queueCapacity": 15,
   "modelDir": null,
   "settings": {
+    "language": "auto",
     "voice": "Bella",
     "speed": 1.0,
     "template": "{user} says: {text}",
@@ -198,7 +224,8 @@ The file is written atomically and can be edited while Yapper is stopped:
 ```
 
 Voice names are case-insensitive and include `Bella`, `Jasper`, `Luna`, `Bruno`, `Rosie`,
-`Hugo`, `Kiki`, `Leo`, or the raw model names such as `expr-voice-2-f`.
+`Hugo`, `Kiki`, `Leo`, or the raw model names such as `expr-voice-2-f`. When the spoken
+language is Ukrainian, choose `uk-UA-PolinaNeural` or `uk-UA-OstapNeural`.
 
 ## Android (experimental)
 
@@ -254,6 +281,9 @@ run `npm run build` instead, since the Rust server serves static files.
 ## Notes and limitations
 
 - TikTok's live protocol is unofficial and can change without notice.
+- WebSocket signing uses [EulerStream](https://eulerstream.com/)'s public endpoint. It is
+  rate-limited and depends on a third-party service; set `SIGN_API_URL`/`SIGN_API_KEY`
+  when using a compatible alternative or paid tier.
 - Gift streaks are read when they complete; very high-traffic rooms may drop messages by
   design (bounded queue, newest wins).
 - KittenTTS is a small model; quality is best at moderate speed with clean English text.
@@ -266,5 +296,6 @@ run `npm run build` instead, since the Rust server serves static files.
   tokenizer/phonemizer design.
 - [TikTokLive](https://github.com/isaackogan/TikTokLive) for documenting the live
   protocol.
+- [EulerStream](https://eulerstream.com/) for the public webcast signing endpoint.
 - [ort](https://github.com/pykeio/ort), [tauri](https://tauri.app),
   [axum](https://github.com/tokio-rs/axum) and the Rust ecosystem.

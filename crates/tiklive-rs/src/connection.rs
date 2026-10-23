@@ -1,7 +1,8 @@
 //! A live connection to one TikTok LIVE room.
 //!
-//! The webcast WebSocket only needs an anonymous `ttwid` cookie, so no request
-//! signing, login, or third-party service is involved.
+//! TikTok's webcast WebSocket requires a signed URL. The signed route data is
+//! fetched from EulerStream, then the initial event batch and signed cookie are
+//! used for the native WebSocket connection.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -12,7 +13,10 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{HeaderValue, COOKIE, ORIGIN, USER_AGENT};
+use tokio_tungstenite::tungstenite::http::header::{
+    HeaderValue, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, ORIGIN, REFERER,
+    USER_AGENT,
+};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 use url::Url;
@@ -20,7 +24,8 @@ use url::Url;
 use crate::error::LiveError;
 use crate::events::{LiveEvent, RoomStatus};
 use crate::proto::{
-    decode_message, decode_socket_frame, encode_ack, encode_enter_room, encode_heartbeat, WS_PATH,
+    decode_message, decode_socket_frame, encode_ack, encode_enter_room, encode_heartbeat,
+    FetchResult, WS_PATH,
 };
 use crate::web::{normalize_username, TikTokWeb};
 
@@ -32,7 +37,8 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 10;
 pub struct ConnectOptions {
     /// Skip the first room lookup and join this room directly.
     pub room_id: Option<String>,
-    /// WebSocket hosts to try, in order. Entries may be full `ws(s)://` base URLs.
+    /// Hosts for the `TIKLIVE_DIRECT` unsigned fallback. Signed connections use
+    /// the push server returned by the signer instead.
     pub ws_hosts: Vec<String>,
     /// Emit the few recent comments TikTok replays on join.
     pub include_history: bool,
@@ -193,6 +199,7 @@ impl LiveClient {
     }
 }
 
+#[derive(Debug)]
 enum AttemptError {
     Offline,
     Dropped(String),
@@ -203,6 +210,17 @@ enum AttemptError {
 enum SocketEnd {
     StreamEnd,
     Cancelled,
+}
+
+struct SocketTarget {
+    label: String,
+    url: Url,
+    cookie: String,
+}
+
+struct SocketPlan {
+    targets: Vec<SocketTarget>,
+    initial: Option<FetchResult>,
 }
 
 async fn run(
@@ -387,21 +405,60 @@ async fn attempt(
         (room.room_id.clone(), Some(room))
     };
 
-    let ttwid = match tokio::time::timeout(timeout, web.ttwid(refresh_ttwid)).await {
-        Err(_) => {
-            return Err(AttemptError::Request(LiveError::RoomLookup(
-                "device cookie request timed out".into(),
-            )))
+    let direct = std::env::var_os("TIKLIVE_DIRECT").is_some();
+    let plan = if direct {
+        let ttwid = match tokio::time::timeout(timeout, web.ttwid(refresh_ttwid)).await {
+            Err(_) => {
+                return Err(AttemptError::Request(LiveError::RoomLookup(
+                    "device cookie request timed out".into(),
+                )))
+            }
+            Ok(result) => result.map_err(AttemptError::Request)?,
+        };
+        let cookie = format!("ttwid={}", ttwid.replace("%7C", "|"));
+        SocketPlan {
+            targets: hosts
+                .iter()
+                .map(|host| SocketTarget {
+                    label: host.clone(),
+                    url: build_ws_url(host, &room_id, &options.heartbeat_interval),
+                    cookie: cookie.clone(),
+                })
+                .collect(),
+            initial: None,
         }
-        Ok(result) => result.map_err(AttemptError::Request)?,
+    } else {
+        let signed = match tokio::time::timeout(timeout, web.signed_socket(&room_id)).await {
+            Err(_) => {
+                return Err(AttemptError::Request(LiveError::Signing(
+                    "sign request timed out".into(),
+                )))
+            }
+            Ok(result) => result.map_err(AttemptError::Request)?,
+        };
+        let url = build_signed_ws_url(
+            &signed.push_server,
+            &room_id,
+            &signed.initial,
+            web.user_agent(),
+            &options.heartbeat_interval,
+        )?;
+        let label = url.host_str().unwrap_or("signed").to_string();
+        SocketPlan {
+            targets: vec![SocketTarget {
+                label,
+                url,
+                cookie: signed.cookie,
+            }],
+            initial: Some(signed.initial),
+        }
     };
 
-    match run_socket(
+    run_socket(
         &room_id,
         room.as_ref(),
-        &ttwid,
         web.user_agent(),
-        hosts,
+        plan,
         options,
         seen,
         ever_connected,
@@ -409,43 +466,14 @@ async fn attempt(
         shutdown,
     )
     .await
-    {
-        Err(AttemptError::Open(detail)) => {
-            // A stale device cookie is the most common cause; retry once with a fresh one.
-            let fresh = tokio::time::timeout(timeout, web.ttwid(true))
-                .await
-                .ok()
-                .and_then(Result::ok);
-            match fresh {
-                Some(fresh) if fresh != ttwid => {
-                    run_socket(
-                        &room_id,
-                        room.as_ref(),
-                        &fresh,
-                        web.user_agent(),
-                        hosts,
-                        options,
-                        seen,
-                        ever_connected,
-                        tx,
-                        shutdown,
-                    )
-                    .await
-                }
-                _ => Err(AttemptError::Open(detail)),
-            }
-        }
-        other => other,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_socket(
     room_id: &str,
     room: Option<&RoomStatus>,
-    ttwid: &str,
     user_agent: &str,
-    hosts: &[String],
+    plan: SocketPlan,
     options: &ConnectOptions,
     seen: &mut RecentIds,
     ever_connected: &mut bool,
@@ -459,9 +487,9 @@ async fn run_socket(
     let mut errors = Vec::new();
     let mut opened = None;
 
-    for host in hosts {
-        let url = build_ws_url(host, room_id, &options.heartbeat_interval);
-        let mut request = url
+    for target in &plan.targets {
+        let mut request = target
+            .url
             .as_str()
             .into_client_request()
             .map_err(|e| AttemptError::Open(format!("invalid websocket URL: {e}")))?;
@@ -472,10 +500,14 @@ async fn run_socket(
         );
         headers.insert(
             COOKIE,
-            HeaderValue::from_str(&format!("ttwid={ttwid}"))
-                .map_err(|_| AttemptError::Open("invalid ttwid cookie".into()))?,
+            HeaderValue::from_str(&target.cookie)
+                .map_err(|_| AttemptError::Open("invalid cookie".into()))?,
         );
         headers.insert(ORIGIN, HeaderValue::from_static("https://www.tiktok.com"));
+        headers.insert(REFERER, HeaderValue::from_static("https://www.tiktok.com/"));
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
 
         match tokio::time::timeout(
             options.connect_timeout,
@@ -483,10 +515,10 @@ async fn run_socket(
         )
         .await
         {
-            Err(_) => errors.push(format!("{host}: connect timed out")),
-            Ok(Err(err)) => errors.push(format!("{host}: {err}")),
+            Err(_) => errors.push(format!("{}: connect timed out", target.label)),
+            Ok(Err(err)) => errors.push(format!("{}: {err}", target.label)),
             Ok(Ok((socket, _response))) => {
-                opened = Some((socket, host.clone()));
+                opened = Some((socket, target.label.clone()));
                 break;
             }
         }
@@ -498,7 +530,8 @@ async fn run_socket(
 
     let (mut sink, mut stream) = socket.split();
 
-    let enter = encode_enter_room(room_num, "");
+    let mut seq_id = 1u64;
+    let enter = encode_enter_room(room_num, "", rand::random::<u64>());
     sink.send(Message::Binary(enter.into()))
         .await
         .map_err(|e| AttemptError::Dropped(format!("enter room failed: {e}")))?;
@@ -514,7 +547,12 @@ async fn run_socket(
     )
     .await;
 
-    let heartbeat = encode_heartbeat(room_num);
+    if let Some(initial) = plan.initial.as_ref() {
+        if emit_messages(initial, options, seen, tx).await {
+            return Ok(SocketEnd::StreamEnd);
+        }
+    }
+
     let mut ticker = tokio::time::interval_at(
         Instant::now() + options.heartbeat_interval,
         options.heartbeat_interval,
@@ -528,7 +566,9 @@ async fn run_socket(
                 return Ok(SocketEnd::Cancelled);
             }
             _ = ticker.tick() => {
-                if let Err(err) = sink.send(Message::Binary(heartbeat.clone().into())).await {
+                seq_id = seq_id.wrapping_add(1);
+                let heartbeat = encode_heartbeat(room_num, seq_id);
+                if let Err(err) = sink.send(Message::Binary(heartbeat.into())).await {
                     return Err(AttemptError::Dropped(format!("heartbeat failed: {err}")));
                 }
             }
@@ -573,31 +613,43 @@ async fn run_socket(
                     continue;
                 };
 
-                if decoded.frame.log_id != 0 {
-                    let ack = encode_ack(decoded.frame.log_id);
+                if decoded.frame.log_id != 0 && !result.internal_ext.is_empty() {
+                    let ack = encode_ack(decoded.frame.log_id, &result.internal_ext);
                     let _ = sink.send(Message::Binary(ack.into())).await;
                 }
 
-                for message in &result.messages {
-                    if message.is_history && !options.include_history {
-                        continue;
-                    }
-                    let msg_id = message.msg_id.to_string();
-                    if !seen.check_and_insert(&msg_id) {
-                        continue;
-                    }
-                    let Some(event) = decode_message(message) else {
-                        continue;
-                    };
-                    let is_stream_end = matches!(event, LiveEvent::StreamEnd { .. });
-                    emit(tx, ConnectionEvent::Event(event)).await;
-                    if is_stream_end {
-                        return Ok(SocketEnd::StreamEnd);
-                    }
+                if emit_messages(&result, options, seen, tx).await {
+                    return Ok(SocketEnd::StreamEnd);
                 }
             }
         }
     }
+}
+
+async fn emit_messages(
+    result: &FetchResult,
+    options: &ConnectOptions,
+    seen: &mut RecentIds,
+    tx: &mpsc::Sender<ConnectionEvent>,
+) -> bool {
+    for message in &result.messages {
+        if message.is_history && !options.include_history {
+            continue;
+        }
+        let msg_id = message.msg_id.to_string();
+        if !seen.check_and_insert(&msg_id) {
+            continue;
+        }
+        let Some(event) = decode_message(message) else {
+            continue;
+        };
+        let is_stream_end = matches!(event, LiveEvent::StreamEnd { .. });
+        emit(tx, ConnectionEvent::Event(event)).await;
+        if is_stream_end {
+            return true;
+        }
+    }
+    false
 }
 
 async fn emit(tx: &mpsc::Sender<ConnectionEvent>, event: ConnectionEvent) {
@@ -614,6 +666,63 @@ fn classify(err: &LiveError) -> ErrorKind {
     }
 }
 
+fn build_signed_ws_url(
+    push_server: &str,
+    room_id: &str,
+    initial: &FetchResult,
+    user_agent: &str,
+    heartbeat: &Duration,
+) -> Result<Url, AttemptError> {
+    let mut url = Url::parse(push_server)
+        .map_err(|e| AttemptError::Open(format!("invalid signed push server: {e}")))?;
+    let heartbeat_ms = heartbeat.as_millis().to_string();
+    let last_rtt = format!("{:.3}", 100.0 + rand::random::<f64>() * 100.0);
+    let browser_version = user_agent.trim_start_matches("Mozilla/").to_string();
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("version_code", "180800")
+            .append_pair("device_platform", "web")
+            .append_pair("cookie_enabled", "true")
+            .append_pair("screen_width", "1920")
+            .append_pair("screen_height", "1080")
+            .append_pair("browser_language", "en-US")
+            .append_pair("browser_platform", "MacIntel")
+            .append_pair("browser_name", "Mozilla")
+            .append_pair("browser_version", &browser_version)
+            .append_pair("browser_online", "true")
+            .append_pair("tz_name", "UTC")
+            .append_pair("app_name", "tiktok_web")
+            .append_pair("sup_ws_ds_opt", "1")
+            .append_pair("update_version_code", "2.0.0")
+            .append_pair("compress", "gzip")
+            .append_pair("webcast_language", "en")
+            .append_pair("ws_direct", "0")
+            .append_pair("aid", "1988")
+            .append_pair("live_id", "12")
+            .append_pair("app_language", "en")
+            .append_pair("client_enter", "1")
+            .append_pair("room_id", room_id)
+            .append_pair("identity", "audience")
+            .append_pair("history_comment_count", "6")
+            .append_pair("last_rtt", &last_rtt)
+            .append_pair("heartbeat_duration", &heartbeat_ms)
+            .append_pair("resp_content_type", "protobuf")
+            .append_pair("did_rule", "3")
+            .append_pair("internal_ext", &initial.internal_ext)
+            .append_pair("cursor", &initial.cursor);
+        for param in &initial.route_params {
+            if !param.key.is_empty() {
+                query.append_pair(&param.key, &param.value);
+            }
+        }
+        query
+            .append_pair("User-Agent", user_agent)
+            .append_pair("version_code", "270000");
+    }
+    Ok(url)
+}
+
 /// Builds the webcast socket URL, mirroring TikTok's web client query params.
 pub fn build_ws_url(host: &str, room_id: &str, heartbeat: &Duration) -> Url {
     let base = if host.starts_with("ws://") || host.starts_with("wss://") {
@@ -623,6 +732,7 @@ pub fn build_ws_url(host: &str, room_id: &str, heartbeat: &Duration) -> Url {
     };
     let mut url = Url::parse(&base).expect("valid base url");
     let heartbeat_ms = heartbeat.as_millis().to_string();
+    let last_rtt = format!("{:.3}", 100.0 + rand::random::<f64>() * 100.0);
     let browser_version = crate::web::DEFAULT_USER_AGENT
         .trim_start_matches("Mozilla/")
         .to_string();
@@ -651,6 +761,7 @@ pub fn build_ws_url(host: &str, room_id: &str, heartbeat: &Duration) -> Url {
         .append_pair("room_id", room_id)
         .append_pair("identity", "audience")
         .append_pair("history_comment_count", "6")
+        .append_pair("last_rtt", &last_rtt)
         .append_pair("heartbeat_duration", &heartbeat_ms)
         .append_pair("resp_content_type", "protobuf")
         .append_pair("did_rule", "3");
@@ -713,6 +824,40 @@ mod tests {
         let url = build_ws_url("wss://example.test/custom", "1", &Duration::from_secs(10));
         assert_eq!(url.host_str(), Some("example.test"));
         assert_eq!(url.path(), "/custom");
+    }
+
+    #[test]
+    fn signed_url_carries_route_params_and_batch_state() {
+        let initial = FetchResult {
+            cursor: "cursor-token".into(),
+            internal_ext: "internal-token".into(),
+            route_params: vec![
+                crate::proto::RouteParam {
+                    key: "wrss".into(),
+                    value: "router-value".into(),
+                },
+                crate::proto::RouteParam {
+                    key: "X-Bogus".into(),
+                    value: "bogus-value".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let url = build_signed_ws_url(
+            "wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/ws_reuse_supplement/",
+            "12345",
+            &initial,
+            "Mozilla/5.0",
+            &Duration::from_secs(10),
+        )
+        .unwrap();
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["room_id"], "12345");
+        assert_eq!(params["cursor"], "cursor-token");
+        assert_eq!(params["internal_ext"], "internal-token");
+        assert_eq!(params["wrss"], "router-value");
+        assert_eq!(params["X-Bogus"], "bogus-value");
+        assert_eq!(params["ws_direct"], "0");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use any_ascii::any_ascii;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::language::{self, resolve_language};
 use crate::MAX_LEN;
 
 pub const VOICES: [&str; 8] = [
@@ -23,8 +24,10 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("space regex"));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct TtsSettings {
+    /// `auto`, `en`, or `uk`.
+    pub language: String,
     pub voice: String,
     pub speed: f32,
     /// Chat template, e.g. `"{user} says: {text}"`.
@@ -46,6 +49,7 @@ pub struct TtsSettings {
 impl Default for TtsSettings {
     fn default() -> Self {
         Self {
+            language: language::AUTO.into(),
             voice: "Bella".into(),
             speed: 1.0,
             template: "{user} says: {text}".into(),
@@ -88,10 +92,12 @@ impl FilterReason {
 
 #[derive(Debug, Clone)]
 pub struct Prepared {
-    /// The original (sanitized) comment.
+    /// The original (sanitized) comment, before any transliteration.
     pub raw: String,
     /// Final text sent to the TTS engine, including the template.
     pub spoken: String,
+    /// Resolved spoken language: `en` or `uk`.
+    pub language: String,
     pub truncated: bool,
     pub transliterated: bool,
 }
@@ -127,8 +133,7 @@ impl TextPipeline {
     ) -> Result<Prepared, FilterReason> {
         self.enforce_cooldown(settings, unique_id, Instant::now())?;
 
-        let was_non_ascii = !text.is_ascii();
-        let (raw, truncated) = clean_text(text, settings.max_len, settings.transliterate);
+        let (raw, truncated) = clean_text(text, settings.max_len);
         if raw.is_empty() {
             return Err(FilterReason::Empty);
         }
@@ -139,15 +144,16 @@ impl TextPipeline {
             return Err(FilterReason::Blacklisted { word });
         }
 
-        let mut spoken = render_template(&settings.template, user, unique_id, &raw);
-        if spoken.trim().is_empty() {
-            spoken = raw.clone();
-        }
+        let language = resolve_language(&settings.language, &raw);
+        let rendered = render_template(&settings.template, user, unique_id, &raw);
+        let (spoken, transliterated) =
+            maybe_transliterate(&rendered, language, settings.transliterate);
         Ok(Prepared {
-            transliterated: settings.transliterate && was_non_ascii && raw.is_ascii(),
             raw,
             spoken,
+            language: language.into(),
             truncated,
+            transliterated,
         })
     }
 
@@ -166,21 +172,24 @@ impl TextPipeline {
         if diamonds < settings.min_gift_diamonds {
             return Err(FilterReason::GiftTooSmall);
         }
-        let spoken = settings
+        let line = settings
             .gift_template
             .replace("{user}", user)
             .replace("{username}", unique_id)
             .replace("{gift}", gift)
             .replace("{count}", &count.to_string());
-        let spoken = SPACE_RE.replace_all(spoken.trim(), " ").to_string();
-        if spoken.is_empty() {
+        let line = SPACE_RE.replace_all(line.trim(), " ").to_string();
+        if line.is_empty() {
             return Err(FilterReason::Empty);
         }
+        let language = resolve_language(&settings.language, &line);
+        let (spoken, transliterated) = maybe_transliterate(&line, language, settings.transliterate);
         Ok(Prepared {
             raw: format!("{gift} x{count}"),
             spoken,
+            language: language.into(),
             truncated: false,
-            transliterated: false,
+            transliterated,
         })
     }
 
@@ -212,9 +221,22 @@ impl TextPipeline {
     }
 }
 
+/// Transliterates only when a message will be spoken by the English
+/// KittenTTS voice; Ukrainian text is always kept as written.
+fn maybe_transliterate(line: &str, language: &str, transliterate: bool) -> (String, bool) {
+    if transliterate && language == language::ENGLISH && !line.is_ascii() {
+        let ascii = any_ascii(line);
+        if !ascii.trim().is_empty() {
+            return (ascii, true);
+        }
+    }
+    (line.to_string(), false)
+}
+
 /// Strips URLs, emojis, zero-width junk and spam runs, then truncates.
+/// The original script is preserved (no transliteration here).
 /// Returns the cleaned text and whether it was truncated.
-pub fn clean_text(text: &str, max_len: usize, transliterate: bool) -> (String, bool) {
+pub fn clean_text(text: &str, max_len: usize) -> (String, bool) {
     let mut cleaned = URL_RE.replace_all(text, " ").into_owned();
     cleaned.retain(|ch| {
         !matches!(ch as u32,
@@ -234,13 +256,6 @@ pub fn clean_text(text: &str, max_len: usize, transliterate: bool) -> (String, b
         .trim_matches(|c: char| c == '"' || c == '\'')
         .trim()
         .to_string();
-
-    if transliterate && !cleaned.is_ascii() {
-        let ascii = any_ascii(&cleaned);
-        if !ascii.trim().is_empty() {
-            cleaned = ascii;
-        }
-    }
 
     let limit = max_len.max(1);
     let mut truncated = false;
@@ -280,7 +295,7 @@ fn collapse_repeats(input: &str) -> String {
 
 /// Backwards-compatible stateless sanitizer.
 pub fn sanitize(text: &str, max_len: usize) -> String {
-    clean_text(text, max_len, true).0
+    clean_text(text, max_len).0
 }
 
 fn blacklisted(text: &str, blacklist: &[String]) -> Option<String> {
@@ -328,7 +343,6 @@ mod tests {
         let (text, _) = clean_text(
             "hi 😂😂 check https://spam.example/x and blah.com now!!!!!!!",
             MAX_LEN,
-            true,
         );
         assert!(!text.contains("http"));
         assert!(!text.contains("😂"));
@@ -340,7 +354,7 @@ mod tests {
     #[test]
     fn truncates_at_word_boundary() {
         let long = "word ".repeat(100);
-        let (text, truncated) = clean_text(&long, 20, true);
+        let (text, truncated) = clean_text(&long, 20);
         assert!(truncated);
         assert!(text.chars().count() <= 20);
         assert!(!text.ends_with(' '));
@@ -374,18 +388,38 @@ mod tests {
     }
 
     #[test]
-    fn transliterates_cyrillic() {
+    fn auto_routes_cyrillic_to_ukrainian_without_transliteration() {
         let p = pipeline();
         let settings = TtsSettings {
             cooldown_secs: 0,
             ..Default::default()
         };
         let prepared = p
+            .prepare_chat(&settings, "Іван", "ivan", "Привіт, як справи?")
+            .unwrap();
+        assert_eq!(prepared.language, language::UKRAINIAN);
+        assert!(!prepared.transliterated);
+        assert!(prepared.raw.contains("Привіт"), "raw: {}", prepared.raw);
+        assert!(prepared.spoken.contains("Привіт"));
+        assert!(prepared.spoken.contains("says:"));
+    }
+
+    #[test]
+    fn english_keeps_original_display_but_transliterates_speech() {
+        let p = pipeline();
+        let settings = TtsSettings {
+            cooldown_secs: 0,
+            language: language::ENGLISH.into(),
+            ..Default::default()
+        };
+        let prepared = p
             .prepare_chat(&settings, "Иван", "ivan", "Привет как дела")
             .unwrap();
+        assert_eq!(prepared.language, language::ENGLISH);
         assert!(prepared.transliterated);
-        assert!(prepared.raw.is_ascii(), "raw: {}", prepared.raw);
+        assert!(prepared.raw.contains("Привет"), "raw: {}", prepared.raw);
         assert!(prepared.spoken.contains("says:"));
+        assert!(prepared.spoken.is_ascii(), "spoken: {}", prepared.spoken);
     }
 
     #[test]

@@ -40,6 +40,6 @@
     ],
     "category": "Utility",
     "shortDescription": "Read TikTok LIVE chat aloud with a local neural voice",
-    "longDescription": "Yapper connects anonymously to a TikTok LIVE stream, filters chat and gifts, and speaks them with the on-device KittenTTS neural voice. It can run as a desktop app or as a LAN server for your phone."
+    "longDescription": "Yapper connects to a TikTok LIVE stream without a TikTok login, filters chat and gifts, and speaks them with the on-device KittenTTS neural voice. It can run as a desktop app or as a LAN server for your phone."
   }
 }

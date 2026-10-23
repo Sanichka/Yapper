@@ -30,6 +30,7 @@ pub struct SynthRequest {
 pub enum EngineKind {
     Onnx,
     Mock,
+    Edge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

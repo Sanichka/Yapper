@@ -1,14 +1,14 @@
 //! Native, dependency-light TikTok LIVE client.
 //!
-//! This crate is a Rust port of the zero-login connection flow used by
-//! [`talkaboutdesign/tiklive`](https://github.com/talkaboutdesign/tiklive):
+//! Connection flow:
 //!
-//! 1. Plain HTTPS room lookup on `tiktok.com` (anonymous, no signing).
-//! 2. Anonymous `ttwid` device cookie harvested from the web page.
-//! 3. WebSocket upgrade to `webcast-ws.tiktok.com` with `Cookie: ttwid=...`.
-//! 4. Protobuf `PushFrame` / `Webcast*Message` decoding.
+//! 1. Plain HTTPS room lookup on `tiktok.com`.
+//! 2. Ask EulerStream's public webcast endpoint for a signed room handshake.
+//! 3. Open `webcast-ws.tiktok.com` with the returned route parameters and
+//!    anonymous cookie.
+//! 4. Decode the initial batch and subsequent protobuf `PushFrame` messages.
 //!
-//! No login, no `X-Bogus`/`msToken` signing, no third-party signing server.
+//! No login is required. Live connections use EulerStream for request signing.
 
 pub mod connection;
 pub mod error;

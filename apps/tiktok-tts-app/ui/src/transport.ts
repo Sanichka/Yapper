@@ -90,6 +90,9 @@ export class Transport {
       case "update_settings":
         response = await post("/api/settings", args.settings);
         break;
+      case "update_app_config":
+        response = await post("/api/config", args.config);
+        break;
       case "speak":
         response = await post("/api/speak", { text: args.text });
         break;
