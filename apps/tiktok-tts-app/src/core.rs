@@ -91,6 +91,7 @@ pub struct AppStateDto {
     pub paused: bool,
     pub stats: StatsDto,
     pub server_mode: bool,
+    pub native_audio: bool,
     pub engine_note: Option<String>,
     pub data_dir: String,
     pub models: Vec<crate::models::ModelDto>,
@@ -153,6 +154,9 @@ pub struct Core {
     engine_note: RwLock<Option<String>>,
     active_downloads: Mutex<std::collections::HashSet<String>>,
     server_mode: bool,
+    native_audio: bool,
+    audio_sink: Option<Arc<dyn crate::audio_sink::AudioSink>>,
+    playback_cancel: Arc<AtomicBool>,
 }
 
 impl Core {
@@ -173,6 +177,14 @@ impl Core {
         }
         let (event_tx, _) = broadcast::channel(512);
         let (ack_tx, ack_rx) = watch::channel(0u64);
+
+        let is_android = crate::android_bridge::is_android();
+        let audio_sink: Option<Arc<dyn crate::audio_sink::AudioSink>> = if is_android {
+            Some(Arc::new(crate::android_bridge::AndroidAudioSink))
+        } else {
+            None
+        };
+        let playback_cancel = Arc::new(AtomicBool::new(false));
 
         Ok(Arc::new(Self {
             config_path,
@@ -199,6 +211,9 @@ impl Core {
             engine_note: RwLock::new(note),
             active_downloads: Mutex::new(std::collections::HashSet::new()),
             server_mode,
+            native_audio: is_android,
+            audio_sink,
+            playback_cancel,
         }))
     }
 
@@ -250,6 +265,7 @@ impl Core {
                 dropped: queue.dropped,
             },
             server_mode: self.server_mode,
+            native_audio: self.native_audio,
             engine_note,
             data_dir: self
                 .config_path
@@ -427,9 +443,19 @@ impl Core {
         if !self.is_current(generation) {
             return;
         }
+        let is_active = matches!(
+            next.status,
+            ConnStatus::Connecting | ConnStatus::Live | ConnStatus::Reconnecting
+        );
         if let Ok(mut state) = self.connection.lock() {
             *state = next;
         }
+        if is_active {
+            crate::android_bridge::start_service();
+        } else {
+            crate::android_bridge::stop_service();
+        }
+        self.sync_mobile_notification();
         self.emit_state();
     }
 
@@ -440,6 +466,8 @@ impl Core {
         }
 
         self.disconnect();
+
+        crate::android_bridge::start_service();
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.set_connection(
@@ -489,6 +517,8 @@ impl Core {
                 error: None,
             };
         }
+        self.sync_mobile_notification();
+        crate::android_bridge::stop_service();
         self.emit_state();
     }
 
@@ -791,6 +821,7 @@ impl Core {
             PushOutcome::Rejected(_) => ("dropped", Some("queue is full".into())),
         };
         self.emit_activity(kind, &user, &raw, status, reason);
+        self.sync_mobile_notification();
         self.emit_state();
         self.wake.notify_one();
     }
@@ -805,7 +836,15 @@ impl Core {
         }
     }
 
+    pub fn playback_cancel(&self) -> Arc<AtomicBool> {
+        self.playback_cancel.clone()
+    }
+
     pub fn skip(&self) {
+        self.playback_cancel.store(true, Ordering::SeqCst);
+        if let Some(sink) = &self.audio_sink {
+            sink.stop();
+        }
         let has_active = self
             .queue
             .lock()
@@ -822,6 +861,7 @@ impl Core {
             // Still synthesizing: drop the audio when it is ready.
             self.skip_requested.store(true, Ordering::SeqCst);
         }
+        self.sync_mobile_notification();
         self.emit_state();
     }
 
@@ -834,16 +874,122 @@ impl Core {
         if removed > 0 {
             self.log("info", format!("cleared {removed} queued messages"));
         }
+        self.sync_mobile_notification();
         self.emit_state();
         removed
     }
 
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
-        if !paused {
+        if paused {
+            self.playback_cancel.store(true, Ordering::SeqCst);
+            if let Some(sink) = &self.audio_sink {
+                sink.stop();
+            }
+        } else {
             self.wake.notify_one();
         }
+        self.sync_mobile_notification();
         self.emit_state();
+    }
+
+    pub fn handle_notification_action(self: &Arc<Self>, action: &str) {
+        match action {
+            "com.sanichka.yapper.ACTION_START_RESUME" | "ACTION_START_RESUME" | "start" | "resume" => {
+                if self.paused.load(Ordering::SeqCst) {
+                    self.set_paused(false);
+                } else {
+                    let status = self
+                        .connection
+                        .lock()
+                        .map(|c| c.status)
+                        .unwrap_or(ConnStatus::Idle);
+                    if matches!(
+                        status,
+                        ConnStatus::Idle | ConnStatus::Offline | ConnStatus::Error
+                    ) {
+                        let username = self.username();
+                        if !username.is_empty() {
+                            let core = self.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = core.connect(&username).await {
+                                    core.log("error", format!("Failed to connect: {e}"));
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            "com.sanichka.yapper.ACTION_STOP_PAUSE" | "ACTION_STOP_PAUSE" | "stop" | "pause" => {
+                self.set_paused(true);
+            }
+            "com.sanichka.yapper.ACTION_SKIP" | "ACTION_SKIP" | "skip" => {
+                self.skip();
+            }
+            other => {
+                tracing::warn!("Unknown notification action: {other}");
+            }
+        }
+    }
+
+    pub fn sync_mobile_notification(&self) {
+        if !crate::android_bridge::is_android() {
+            return;
+        }
+        let (status, username) = {
+            let conn = self.connection.lock().ok();
+            (
+                conn.as_ref().map(|c| c.status).unwrap_or(ConnStatus::Idle),
+                conn.as_ref().map(|c| c.username.clone()).unwrap_or_default(),
+            )
+        };
+        let is_paused = self.paused.load(Ordering::SeqCst);
+        let is_connected = status == ConnStatus::Live;
+
+        let title = match status {
+            ConnStatus::Live => {
+                if is_paused {
+                    format!("Yapper • Paused (@{username})")
+                } else {
+                    format!("Yapper • Connected to @{username}")
+                }
+            }
+            ConnStatus::Connecting => format!("Yapper • Connecting to @{username}..."),
+            ConnStatus::Reconnecting => format!("Yapper • Reconnecting to @{username}..."),
+            ConnStatus::Offline => "Yapper • Stream Offline".to_string(),
+            ConnStatus::Error => "Yapper • Connection Error".to_string(),
+            ConnStatus::Idle => {
+                if is_paused {
+                    "Yapper • Paused".to_string()
+                } else if !username.is_empty() {
+                    format!("Yapper • Idle (@{username})")
+                } else {
+                    "Yapper • Idle".to_string()
+                }
+            }
+        };
+
+        let (active_item, queue_depth) = self
+            .queue
+            .lock()
+            .map(|q| (q.active_item(), q.pending_len()))
+            .unwrap_or((None, 0));
+
+        let text = if let Some(item) = active_item {
+            format!("{}: {} (Queue: {queue_depth})", item.user, item.raw)
+        } else if queue_depth > 0 {
+            format!("Queue: {queue_depth} message(s) waiting")
+        } else {
+            "Listening to live stream...".to_string()
+        };
+
+        crate::android_bridge::update_notification(
+            &title,
+            &text,
+            queue_depth,
+            is_paused,
+            is_connected,
+        );
     }
 
     pub fn speak(self: &Arc<Self>, text: &str) -> Result<(), String> {
@@ -991,12 +1137,23 @@ impl Core {
                     let seq = self.utterance_seq.fetch_add(1, Ordering::SeqCst) + 1;
                     self.active_seq.store(seq, Ordering::SeqCst);
                     self.stats_spoken.fetch_add(1, Ordering::Relaxed);
+                    self.playback_cancel.store(false, Ordering::SeqCst);
+
                     let _ = self.event_tx.send(ServerEvent::Utterance {
                         seq,
                         item: item.clone(),
                         wav: audio,
                         duration_ms,
                     });
+                    self.sync_mobile_notification();
+
+                    if let Some(sink) = &self.audio_sink {
+                        let cancel = self.playback_cancel.clone();
+                        if let Err(e) = sink.play(seq, &samples, sample_rate, cancel) {
+                            tracing::error!("Audio sink playback error: {e}");
+                        }
+                    }
+
                     self.wait_for_ack(seq, duration_ms).await;
                     self.active_seq.store(0, Ordering::SeqCst);
                     self.skip_requested.store(false, Ordering::SeqCst);
@@ -1013,6 +1170,7 @@ impl Core {
             if let Ok(mut queue) = self.queue.lock() {
                 queue.finish_active();
             }
+            self.sync_mobile_notification();
             self.emit_state();
         }
     }

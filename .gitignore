@@ -8,7 +8,11 @@
 **/dist
 
 # Tauri
-apps/tiktok-tts-app/gen
+apps/tiktok-tts-app/gen/**/build/
+apps/tiktok-tts-app/gen/**/.gradle/
+apps/tiktok-tts-app/gen/**/jniLibs/
+apps/tiktok-tts-app/gen/**/.idea/
+apps/tiktok-tts-app/gen/**/local.properties
 
 # Models and generated assets
 models/
@@ -21,3 +25,4 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+.agents/

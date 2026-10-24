@@ -1,7 +1,9 @@
 //! Yapper application core shared by the desktop, mobile and server shells.
 
+pub mod android_bridge;
+pub mod audio_sink;
 mod config;
-mod core;
+pub mod core;
 #[cfg(feature = "desktop")]
 mod desktop;
 mod edge;

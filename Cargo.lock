@@ -4347,6 +4347,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-util",
+ "jni",
  "kittentts-rs",
  "nanomp3",
  "rand 0.9.5",

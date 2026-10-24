@@ -72,7 +72,13 @@ async function boot(): Promise<void> {
     toast(`Could not subscribe to events: ${message(error)}`, "error");
   }
   try {
-    applyState(await transport.fetchState());
+    const initial = await transport.fetchState();
+    applyState(initial);
+    if (initial.nativeAudio) {
+      void transport
+        .call("request_notification_permission")
+        .catch(() => undefined);
+    }
   } catch (error) {
     toast(`Could not reach the Yapper backend: ${message(error)}`, "error");
   }
@@ -84,7 +90,14 @@ function onEvent(event: ServerEvent): void {
       applyState(event.state);
       break;
     case "utterance":
-      void playUtterance(event.seq, event.wav, event.item.id, event.durationMs);
+      if (state?.nativeAudio) {
+        // Handled natively by Android Foreground Service / AudioTrack
+        currentSeq = event.seq;
+        playing = { id: event.item.id, durationMs: event.durationMs };
+        renderNow();
+      } else {
+        void playUtterance(event.seq, event.wav, event.item.id, event.durationMs);
+      }
       break;
     case "activity":
       feed.unshift({ ...event, at: Date.now() });
@@ -115,6 +128,12 @@ function onEvent(event: ServerEvent): void {
 function applyState(next: AppStateDto): void {
   const previous = state;
   state = next;
+
+  if (next.nativeAudio && !next.queue.active && playing) {
+    playing = null;
+    currentSeq = null;
+  }
+
   if (
     previous &&
     previous.connection.status !== next.connection.status &&
@@ -690,10 +709,12 @@ function bind(): void {
 
   $("#pause-btn").addEventListener("click", () => {
     if (!state) return;
+    player.stop();
     void command("set_paused", { paused: !state.paused });
   });
 
   $("#skip-btn").addEventListener("click", () => {
+    player.stop();
     void command("skip");
   });
 

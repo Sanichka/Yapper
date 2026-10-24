@@ -43,5 +43,9 @@ url.workspace = true
 
 tauri = { version = "2", optional = true , features = [] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+

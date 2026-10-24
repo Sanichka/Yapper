@@ -93,8 +93,32 @@ fn delete_model(core: AppCore<'_>, model_id: String) -> Result<AppStateDto, Stri
     Ok(core.state())
 }
 
+#[tauri::command]
+fn check_notification_permission() -> bool {
+    true
+}
+
+#[tauri::command]
+fn request_notification_permission() -> bool {
+    true
+}
+
+fn tts_mobile_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("ttsService")
+        .setup(|_app, _api| {
+            #[cfg(target_os = "android")]
+            {
+                let _handle =
+                    _api.register_android_plugin("com.sanichka.yapper", "TtsServicePlugin")?;
+            }
+            Ok(())
+        })
+        .build()
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tts_mobile_plugin())
         .setup(|app| {
             let config_path = app
                 .path()
@@ -102,6 +126,7 @@ pub fn run() {
                 .map(|dir| dir.join("config.json"))
                 .unwrap_or_else(|_| config::default_config_path());
             let core = Core::new(config_path, None, false).map_err(std::io::Error::other)?;
+            crate::android_bridge::register_core(core.clone());
 
             let synth = core.clone();
             tauri::async_runtime::spawn(async move { synth.run_synth_loop().await });
@@ -151,6 +176,8 @@ pub fn run() {
             download_model,
             switch_model,
             delete_model,
+            check_notification_permission,
+            request_notification_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Yapper");

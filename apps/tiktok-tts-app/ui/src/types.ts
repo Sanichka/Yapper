@@ -118,6 +118,7 @@ export interface AppStateDto {
   paused: boolean;
   stats: Stats;
   serverMode: boolean;
+  nativeAudio?: boolean;
   engineNote: string | null;
   dataDir: string;
   models: ModelDto[];

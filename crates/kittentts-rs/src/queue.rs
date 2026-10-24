@@ -105,6 +105,18 @@ impl BoundedQueue {
         self.active.as_ref()
     }
 
+    pub fn active_item(&self) -> Option<QueueItem> {
+        self.active.clone()
+    }
+
+    pub fn has_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.items.len()
+    }
+
     pub fn set_capacity(&mut self, capacity: usize) {
         self.capacity = capacity.max(1);
         while self.items.len() > self.capacity {

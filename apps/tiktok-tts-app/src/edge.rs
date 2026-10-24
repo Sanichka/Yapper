@@ -58,33 +58,17 @@ impl TtsEngine for EdgeEngine {
         let rate =
             (((request.speed.clamp(0.5, 2.0) - 1.0) * 100.0).round() as i32).clamp(-50, 100);
 
-        let audio_bytes = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => match handle.runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => {
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(synthesize_via_edge(text, &request.voice, rate))
-                    })?
-                }
-                _ => std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| TtsError::Service(e.to_string()))?;
-                        rt.block_on(synthesize_via_edge(text, &request.voice, rate))
-                    })
-                    .join()
-                    .map_err(|_| TtsError::Service("Edge TTS worker thread panicked".into()))?
-                })?,
-            },
-            Err(_) => {
+        let audio_bytes = std::thread::scope(|s| {
+            s.spawn(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| TtsError::Service(e.to_string()))?;
-                rt.block_on(synthesize_via_edge(text, &request.voice, rate))?
-            }
-        };
+                rt.block_on(synthesize_via_edge(text, &request.voice, rate))
+            })
+            .join()
+            .map_err(|_| TtsError::Service("Edge TTS worker thread panicked".into()))?
+        })?;
 
         decode_mp3(&audio_bytes)
     }
@@ -249,5 +233,12 @@ mod tests {
         assert!(res.is_ok(), "synthesis failed: {:?}", res.err());
         let samples = res.unwrap();
         assert!(!samples.is_empty());
+        let min = samples.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = samples.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        println!("Edge samples count={}, min={}, max={}", samples.len(), min, max);
+        let pcm = crate::audio_sink::samples_to_pcm16_le(&samples);
+        let pcm_min = pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).min().unwrap_or(0);
+        let pcm_max = pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).max().unwrap_or(0);
+        println!("PCM bytes count={}, pcm_min={}, pcm_max={}", pcm.len(), pcm_min, pcm_max);
     }
 }

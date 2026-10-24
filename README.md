@@ -244,11 +244,14 @@ language is Ukrainian, choose `uk-UA-PolinaNeural` or `uk-UA-OstapNeural`.
 
 ## Android
 
-Yapper runs natively on Android (`arm64-v8a`) powered by Tauri v2:
+Yapper runs natively on Android (`arm64-v8a`) powered by Tauri v2 with native background streaming:
 
-- **Compact release size**: Release builds use LTO, symbol stripping, and resource shrinking to keep the APK around **~32 MB** while embedding full ONNX inference and Web Audio playback.
-- **In-app model download**: No manual file transfers needed. Tap the **Models** badge in the mobile UI to download KittenTTS directly to the device's internal storage over Wi-Fi.
-- **Bundled dependencies**: The APK bundles `libc++_shared.so` alongside the Rust binary to ensure smooth ONNX Runtime compatibility across Android 7.0+ (API 24+).
+- **Background Execution (Foreground Service)**: Keeps CPU and Wi-Fi alive (`WakeLock` + `WifiLock`) while streaming so Yapper continues listening to TikTok LIVE chat and synthesizing speech even when minimized or when you switch over to the TikTok app.
+- **Notification Shade Media Controller**: Persistent interactive Android notification shade controller displaying real-time stream state (`Yapper • Connected to @creator`), queue depth, and interactive Pause / Resume / Skip buttons.
+- **Hardware-Direct AudioTrack Playback**: Bypasses WebView audio downmixers with native low-latency stereo 16-bit PCM streaming directly to device speakers, with immediate mid-sentence interruption on Skip.
+- **Compact Release Size**: Release builds use LTO, symbol stripping, and ProGuard optimization to keep the APK around **~32 MB** while embedding full ONNX inference and local neural synthesis.
+- **In-App Model Download**: No manual file transfers needed. Tap the **Models** badge in the mobile UI to download KittenTTS directly to the device's internal storage over Wi-Fi.
+- **Bundled Dependencies**: The APK bundles `libc++_shared.so` alongside the Rust binary to ensure smooth ONNX Runtime compatibility across Android 7.0+ (API 24+).
 
 ### Building the APK locally
 
@@ -257,7 +260,15 @@ Prerequisites:
 - Java 17+ (or JDK 23)
 - `rustup target add aarch64-linux-android`
 
-Set up the environment and build:
+#### One-Click Build Script (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\.agents\skills\android-apk-build\scripts\build-apk.ps1
+```
+
+The script automatically builds the frontend, cross-compiles the Rust release `cdylib`, bundles `libc++_shared.so`, runs Gradle assembly, and copies the signed APK to `release/yapper-v0.0.2-arm64.apk`.
+
+#### Manual Step-by-Step Build
 
 ```powershell
 $env:JAVA_HOME = "C:\Program Files\Java\jdk-23"
@@ -265,18 +276,28 @@ $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
 $env:NDK_HOME = "$env:ANDROID_HOME\ndk\27.0.12077973"
 $env:ANDROID_NDK_HOME = $env:NDK_HOME
 
-# In apps/tiktok-tts-app:
-npx -y @tauri-apps/cli android build --apk --target aarch64 --ci
-```
+# 1. Build frontend
+cd apps\tiktok-tts-app\ui
+npm run build
+cd ..\..\..
 
-On Windows without developer mode (symlink restrictions), copy the compiled `.so` from `target/aarch64-linux-android/release/libtiktok_tts_app_lib.so` into `apps/tiktok-tts-app/gen/android/app/src/main/jniLibs/arm64-v8a/` and run:
+# 2. Cross-compile Rust cdylib
+cargo build --package tiktok-tts-app --target aarch64-linux-android --release
 
-```powershell
-cd apps/tiktok-tts-app/gen/android
+# 3. Copy binary and libc++ to jniLibs (bypasses Windows symlink restrictions)
+$jniDir = "apps\tiktok-tts-app\gen\android\app\src\main\jniLibs\arm64-v8a"
+New-Item -ItemType Directory -Force -Path $jniDir | Out-Null
+Copy-Item "target\aarch64-linux-android\release\libtiktok_tts_app_lib.so" -Destination "$jniDir\" -Force
+$libcxx = Get-ChildItem -Path $env:NDK_HOME -Recurse -Filter "libc++_shared.so" | Where-Object { $_.FullName -like "*aarch64*" } | Select-Object -First 1
+Copy-Item $libcxx.FullName -Destination "$jniDir\" -Force
+
+# 4. Assemble release APK with Gradle
+cd apps\tiktok-tts-app\gen\android
 .\gradlew.bat assembleArm64Release -x rustBuildArm64Release -x rustBuildUniversalRelease
+cd ..\..\..
 ```
 
-The resulting signed APK is saved to `apps/tiktok-tts-app/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk` (and copied to `release/yapper-v0.0.1-arm64.apk`).
+The resulting signed APK is saved to `apps/tiktok-tts-app/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk` and copied to `release/yapper-v0.0.2-arm64.apk`.
 
 
 ## Releases and CI
@@ -286,7 +307,7 @@ The resulting signed APK is saved to `apps/tiktok-tts-app/gen/android/app/build/
 Ubuntu 24.04 because the prebuilt ONNX Runtime requires glibc 2.38 or newer.
 
 The workflow only builds when the pushed commit message contains the version from
-`Cargo.toml` (for example `Release v0.0.1`) or when a matching `v<version>` tag is pushed.
+`Cargo.toml` (for example `Release v0.0.2`) or when a matching `v<version>` tag is pushed.
 `workflow_dispatch` always builds. Tags additionally publish a GitHub release with every
 artifact. The version gate fails early if `Cargo.toml`, `tauri.conf.json`, or the UI
 package versions disagree.
@@ -295,10 +316,10 @@ To cut a release:
 
 ```bash
 # bump the version in Cargo.toml, tauri.conf.json, ui/package.json and ui/package-lock.json
-git commit -am "Release v0.0.1"
+git commit -am "Release v0.0.2"
 git push origin main
-git tag -a v0.0.1 -m "Yapper v0.0.1"
-git push origin v0.0.1
+git tag -a v0.0.2 -m "Yapper v0.0.2"
+git push origin v0.0.2
 ```
 
 The Android artifact is a debug-signed APK for testing; configure a keystore to sign a

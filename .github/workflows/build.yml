@@ -140,12 +140,37 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: Build ${{ matrix.name }}
-        if: runner.os != 'Linux'
+      - name: Build ${{ matrix.name }} (Windows)
+        if: runner.os == 'Windows'
         working-directory: apps/tiktok-tts-app
         run: cargo tauri build --bundles ${{ matrix.bundles }} --ci
 
-      - name: Build ${{ matrix.name }}
+      - name: Build ${{ matrix.name }} (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: apps/tiktok-tts-app
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.4"
+        run: |
+          set -o pipefail
+          cargo tauri build --bundles ${{ matrix.bundles }} --ci 2>&1 | tee tauri-build.log
+
+      - name: Report macOS build failure
+        if: failure() && runner.os == 'macOS'
+        shell: bash
+        working-directory: apps/tiktok-tts-app
+        run: |
+          python3 - <<'PY'
+          import os
+          path = "tauri-build.log"
+          if os.path.exists(path):
+              text = open(path, errors="replace").read()[-6000:]
+              text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=macOS build failed::{text}")
+          PY
+          exit 1
+
+      - name: Build ${{ matrix.name }} (Linux)
         if: runner.os == 'Linux'
         shell: bash
         working-directory: apps/tiktok-tts-app
@@ -220,9 +245,14 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: Initialize Android project
+      - name: Initialize Android project if missing
         working-directory: apps/tiktok-tts-app
-        run: cargo tauri android init --ci
+        run: |
+          if [ ! -d "gen/android" ]; then
+            cargo tauri android init --ci
+          else
+            echo "gen/android already exists; preserving custom foreground service and configs."
+          fi
 
       - name: Bundle Android C++ runtime and configure release signing
         shell: bash
@@ -243,9 +273,10 @@ jobs:
           path = "apps/tiktok-tts-app/gen/android/app/build.gradle.kts"
           with open(path, "r") as f:
               content = f.read()
-          content = content.replace("getByName(\"release\") {", "getByName(\"release\") {\n            signingConfig = signingConfigs.getByName(\"debug\")")
-          with open(path, "w") as f:
-              f.write(content)
+          if "signingConfig = signingConfigs" not in content:
+              content = content.replace("getByName(\"release\") {", "getByName(\"release\") {\n            signingConfig = signingConfigs.getByName(\"debug\")")
+              with open(path, "w") as f:
+                  f.write(content)
           '
 
       - name: Build release APK
