@@ -33,7 +33,7 @@ pub fn run_server() {
 // by clang compiler-rt when targeting macOS >= 13.4. Rustc defaults to macOS 11.0 on aarch64.
 // Providing a weak assembly definition guarantees the symbol is always resolved without duplicate symbol errors.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-core::arch::global_asm!(
+std::arch::global_asm!(
     ".globl ___isPlatformVersionAtLeast",
     ".weak_definition ___isPlatformVersionAtLeast",
     "___isPlatformVersionAtLeast:",
@@ -42,7 +42,7 @@ core::arch::global_asm!(
 );
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-core::arch::global_asm!(
+std::arch::global_asm!(
     ".globl ___isPlatformVersionAtLeast",
     ".weak_definition ___isPlatformVersionAtLeast",
     "___isPlatformVersionAtLeast:",
