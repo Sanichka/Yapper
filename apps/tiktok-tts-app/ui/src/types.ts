@@ -88,6 +88,26 @@ export interface Stats {
   dropped: number;
 }
 
+export interface ModelDto {
+  id: string;
+  name: string;
+  description: string;
+  approxSizeMb: number;
+  installed: boolean;
+  active: boolean;
+  diskSizeBytes?: number;
+}
+
+export interface ModelProgressEvent {
+  modelId: string;
+  status: "downloading" | "verifying" | "complete" | "error";
+  percent: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  currentFile: string;
+  message?: string;
+}
+
 export interface AppStateDto {
   connection: ConnectionState;
   engine: EngineStatus;
@@ -100,6 +120,7 @@ export interface AppStateDto {
   serverMode: boolean;
   engineNote: string | null;
   dataDir: string;
+  models: ModelDto[];
 }
 
 export interface ActivityEvent {
@@ -121,4 +142,5 @@ export type ServerEvent =
       durationMs: number;
     }
   | ({ type: "activity" } & ActivityEvent)
-  | { type: "log"; level: string; message: string };
+  | { type: "log"; level: string; message: string }
+  | ({ type: "modelProgress" } & ModelProgressEvent);

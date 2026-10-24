@@ -11,7 +11,7 @@ use kittentts_rs::queue::QueueSnapshot;
 use kittentts_rs::text::{FilterReason, TextPipeline, TtsSettings};
 use kittentts_rs::{
     create_engine, wav, wav_bytes, BoundedQueue, EngineStatus, Priority, PushOutcome, QueueItem,
-    SynthRequest, TtsEngine, SAMPLE_RATE,
+    SynthRequest, TtsEngine, TtsError, SAMPLE_RATE,
 };
 use serde::{Deserialize, Serialize};
 use tiklive_rs::{
@@ -93,6 +93,7 @@ pub struct AppStateDto {
     pub server_mode: bool,
     pub engine_note: Option<String>,
     pub data_dir: String,
+    pub models: Vec<crate::models::ModelDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +125,7 @@ pub enum ServerEvent {
         level: String,
         message: String,
     },
+    ModelProgress(crate::models::ModelProgressEvent),
 }
 
 pub struct Core {
@@ -148,7 +150,8 @@ pub struct Core {
     utterance_seq: AtomicU64,
     active_seq: AtomicU64,
     skip_requested: AtomicBool,
-    engine_note: Option<String>,
+    engine_note: RwLock<Option<String>>,
+    active_downloads: Mutex<std::collections::HashSet<String>>,
     server_mode: bool,
 }
 
@@ -175,7 +178,7 @@ impl Core {
             config_path,
             config: Mutex::new(persisted),
             engine: RwLock::new(engine),
-            edge_engine: Arc::new(crate::edge::EdgeEngine),
+            edge_engine: Arc::new(crate::edge::EdgeEngine::default()),
             event_tx,
             queue: Mutex::new(BoundedQueue::new(queue_capacity)),
             pipeline: TextPipeline::new(),
@@ -193,7 +196,8 @@ impl Core {
             utterance_seq: AtomicU64::new(0),
             active_seq: AtomicU64::new(0),
             skip_requested: AtomicBool::new(false),
-            engine_note: note,
+            engine_note: RwLock::new(note),
+            active_downloads: Mutex::new(std::collections::HashSet::new()),
             server_mode,
         }))
     }
@@ -226,6 +230,12 @@ impl Core {
                 voices: Vec::new(),
                 threads: 0,
             });
+        let engine_note = self
+            .engine_note
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let models = self.get_models();
         AppStateDto {
             connection,
             engine,
@@ -240,12 +250,13 @@ impl Core {
                 dropped: queue.dropped,
             },
             server_mode: self.server_mode,
-            engine_note: self.engine_note.clone(),
+            engine_note,
             data_dir: self
                 .config_path
                 .parent()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            models,
             queue,
         }
     }
@@ -855,6 +866,97 @@ impl Core {
         Ok(())
     }
 
+    async fn synthesize_item(&self, item: &QueueItem) -> Result<Vec<f32>, TtsError> {
+        let is_auto = item.language == language::AUTO
+            || (item.language != language::UKRAINIAN && language::is_mixed(&item.text));
+
+        if is_auto {
+            let segments = language::split_by_language(&item.text);
+            if segments.is_empty() {
+                return Err(TtsError::BadText("empty text".into()));
+            }
+
+            let mut all_samples: Vec<f32> = Vec::new();
+            let mut last_error: Option<TtsError> = None;
+            let pause_samples = (kittentts_rs::SAMPLE_RATE as f32 * 0.080) as usize;
+
+            for seg in segments {
+                let seg_text = seg.text.trim().to_string();
+                if seg_text.is_empty() {
+                    continue;
+                }
+                let (engine, voice) = if seg.language == language::UKRAINIAN {
+                    (
+                        self.edge_engine.clone(),
+                        language::voice_for_language(language::UKRAINIAN, &item.voice),
+                    )
+                } else {
+                    let local = self
+                        .engine
+                        .read()
+                        .map(|e| e.clone())
+                        .unwrap_or_else(|_| Arc::new(kittentts_rs::MockEngine::new()));
+                    (
+                        local,
+                        language::voice_for_language(language::ENGLISH, &item.voice),
+                    )
+                };
+
+                let req = SynthRequest {
+                    text: seg_text,
+                    voice,
+                    speed: item.speed,
+                };
+
+                let res = tokio::task::spawn_blocking(move || engine.synthesize(&req)).await;
+                match res {
+                    Ok(Ok(samples)) if !samples.is_empty() => {
+                        if !all_samples.is_empty() {
+                            all_samples.extend(std::iter::repeat(0.0f32).take(pause_samples));
+                        }
+                        all_samples.extend(samples);
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!("Failed segment synthesis: {err}");
+                        last_error = Some(err);
+                    }
+                    Err(join_err) => {
+                        tracing::warn!("Synthesis task panicked: {join_err}");
+                        last_error = Some(TtsError::Service(join_err.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+
+            if all_samples.is_empty() {
+                if let Some(err) = last_error {
+                    return Err(err);
+                }
+                return Err(TtsError::EmptyAudio);
+            }
+            Ok(all_samples)
+        } else {
+            let engine = if item.language == language::UKRAINIAN {
+                self.edge_engine.clone()
+            } else {
+                self.engine
+                    .read()
+                    .map(|engine| engine.clone())
+                    .unwrap_or_else(|_| Arc::new(kittentts_rs::MockEngine::new()))
+            };
+            let request = SynthRequest {
+                text: item.text.clone(),
+                voice: item.voice.clone(),
+                speed: item.speed,
+            };
+            let res = tokio::task::spawn_blocking(move || engine.synthesize(&request)).await;
+            match res {
+                Ok(inner) => inner,
+                Err(join_err) => Err(TtsError::Service(join_err.to_string())),
+            }
+        }
+    }
+
     pub async fn run_synth_loop(self: Arc<Self>) {
         loop {
             if self.paused.load(Ordering::SeqCst) {
@@ -876,26 +978,13 @@ impl Core {
             };
             self.emit_state();
 
-            let engine = if item.language == language::UKRAINIAN {
-                self.edge_engine.clone()
-            } else {
-                self.engine
-                    .read()
-                    .map(|engine| engine.clone())
-                    .unwrap_or_else(|_| Arc::new(kittentts_rs::MockEngine::new()))
-            };
-            let sample_rate = engine.sample_rate();
-            let request = SynthRequest {
-                text: item.text.clone(),
-                voice: item.voice.clone(),
-                speed: item.speed,
-            };
+            let sample_rate = kittentts_rs::SAMPLE_RATE;
             let label = format!("{}: {}", item.user, item.raw);
-            let result = tokio::task::spawn_blocking(move || engine.synthesize(&request)).await;
+            let result = self.synthesize_item(&item).await;
             let skip = self.skip_requested.swap(false, Ordering::SeqCst);
 
             match result {
-                Ok(Ok(samples)) if !skip => {
+                Ok(samples) if !skip => {
                     let duration_ms = wav::duration_ms(samples.len(), sample_rate);
                     let bytes = wav_bytes(&samples, sample_rate);
                     let audio = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -912,15 +1001,12 @@ impl Core {
                     self.active_seq.store(0, Ordering::SeqCst);
                     self.skip_requested.store(false, Ordering::SeqCst);
                 }
-                Ok(Ok(_)) => {
+                Ok(_) => {
                     self.log("info", format!("skipped {label}"));
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     self.stats_filtered.fetch_add(1, Ordering::Relaxed);
                     self.log("error", format!("TTS failed for {label}: {error}"));
-                }
-                Err(error) => {
-                    self.log("error", format!("TTS worker failed: {error}"));
                 }
             }
 
@@ -945,6 +1031,141 @@ impl Core {
             _ = wait => {}
             _ = timeout => {}
         }
+    }
+
+    pub fn models_dir(&self) -> PathBuf {
+        self.config_path
+            .parent()
+            .map(|p| p.join("models"))
+            .unwrap_or_else(|| PathBuf::from("models"))
+    }
+
+    pub fn active_model_dir(&self) -> Option<PathBuf> {
+        let configured = self.config.lock().ok()?.model_dir.clone();
+        config::resolve_model_dir(&self.config_path, configured.as_deref())
+    }
+
+    pub fn get_models(&self) -> Vec<crate::models::ModelDto> {
+        crate::models::list_models(&self.models_dir(), self.active_model_dir().as_deref())
+    }
+
+    pub async fn download_model(self: &Arc<Self>, model_id: String) -> Result<(), String> {
+        {
+            let mut active = self.active_downloads.lock().map_err(|e| e.to_string())?;
+            if active.contains(&model_id) {
+                return Err(format!("Download already in progress for {model_id}"));
+            }
+            active.insert(model_id.clone());
+        }
+
+        let models_dir = self.models_dir();
+        let event_tx = self.event_tx.clone();
+        let mid = model_id.clone();
+        let result = crate::models::download_model(
+            models_dir.clone(),
+            model_id.clone(),
+            move |ev| {
+                let _ = event_tx.send(ServerEvent::ModelProgress(ev));
+            },
+            None,
+        )
+        .await;
+
+        {
+            if let Ok(mut active) = self.active_downloads.lock() {
+                active.remove(&model_id);
+            }
+        }
+
+        match result {
+            Ok(target_dir) => {
+                match kittentts_rs::KittenEngine::from_dir(&target_dir) {
+                    Ok(new_engine) => {
+                        if let Ok(mut engine) = self.engine.write() {
+                            *engine = Arc::new(new_engine);
+                        }
+                        if let Ok(mut note) = self.engine_note.write() {
+                            *note = None;
+                        }
+                        if let Ok(mut config) = self.config.lock() {
+                            config.model_dir = Some(target_dir.display().to_string());
+                            let _ = config.save(&self.config_path);
+                        }
+                        self.emit_state();
+                        self.log("info", format!("Activated KittenTTS model: {mid}"));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let err = format!("Failed to initialize downloaded engine: {e}");
+                        self.log("error", &err);
+                        Err(err)
+                    }
+                }
+            }
+            Err(e) => {
+                self.log("error", format!("Failed to download model {model_id}: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    pub fn switch_model(&self, model_id: &str) -> Result<(), String> {
+        let models_dir = self.models_dir();
+        let target_dir = models_dir.join(model_id);
+        if !target_dir.is_dir() {
+            return Err(format!("Model directory does not exist: {}", target_dir.display()));
+        }
+
+        let new_engine = kittentts_rs::KittenEngine::from_dir(&target_dir)
+            .map_err(|e| format!("Failed to load model from {}: {e}", target_dir.display()))?;
+
+        if let Ok(mut engine) = self.engine.write() {
+            *engine = Arc::new(new_engine);
+        }
+        if let Ok(mut note) = self.engine_note.write() {
+            *note = None;
+        }
+        if let Ok(mut config) = self.config.lock() {
+            config.model_dir = Some(target_dir.display().to_string());
+            let _ = config.save(&self.config_path);
+        }
+        self.emit_state();
+        self.log("info", format!("Switched to model {model_id}"));
+        Ok(())
+    }
+
+    pub fn delete_model(&self, model_id: &str) -> Result<(), String> {
+        let models_dir = self.models_dir();
+        let target_dir = models_dir.join(model_id);
+        if !target_dir.exists() {
+            return Ok(());
+        }
+
+        let is_active = self
+            .active_model_dir()
+            .and_then(|p| p.file_name().map(|n| n == model_id))
+            .unwrap_or(false);
+
+        if is_active {
+            let (fallback, note) = kittentts_rs::create_engine(None);
+            if let Ok(mut engine) = self.engine.write() {
+                *engine = fallback;
+            }
+            if let Ok(mut engine_note) = self.engine_note.write() {
+                *engine_note = note;
+            }
+            if let Ok(mut config) = self.config.lock() {
+                config.model_dir = None;
+                let _ = config.save(&self.config_path);
+            }
+        }
+
+        std::fs::remove_dir_all(&target_dir)
+            .map_err(|e| format!("Failed to delete {}: {e}", target_dir.display()))?;
+
+        self.emit_state();
+        self.log("info", format!("Deleted model {model_id}"));
+        Ok(())
     }
 }
 
@@ -1029,6 +1250,30 @@ mod tests {
             })
             .is_err());
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn mixed_language_synthesizes_both_languages() {
+        let (path, dir) = temp_config("mixed");
+        let core = Core::new(path, Some(dir.join("missing-model")), false).unwrap();
+
+        let item = QueueItem {
+            id: 1,
+            user: "Alex".into(),
+            unique_id: "alex".into(),
+            text: "Hi Dear це тестування змішування language so it can be both languages simultaneously".into(),
+            raw: "Hi Dear це тестування змішування language so it can be both languages simultaneously".into(),
+            language: language::AUTO.into(),
+            priority: Priority::Normal,
+            kind: "chat".into(),
+            voice: "Bella".into(),
+            speed: 1.0,
+            created_at: 0,
+        };
+
+        let samples = core.synthesize_item(&item).await.unwrap();
+        assert!(!samples.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

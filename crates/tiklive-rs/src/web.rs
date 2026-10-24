@@ -224,22 +224,42 @@ impl TikTokWeb {
         let status = res.status().as_u16();
         let text = res.text().await?;
 
+        if status == 429 {
+            if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                return Ok(room);
+            }
+            return Err(LiveError::RateLimited { status: 429 });
+        }
         if !(200..300).contains(&status) {
+            if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                return Ok(room);
+            }
             return Err(LiveError::RoomLookup(format!("HTTP {status}")));
         }
         if text.is_empty() {
-            return Err(LiveError::RoomLookup(
-                "empty response (likely rate limited)".into(),
-            ));
+            if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                return Ok(room);
+            }
+            return Err(LiveError::RateLimited { status: 429 });
         }
 
-        let body: RoomApiResponse = serde_json::from_str(&text)
-            .map_err(|e| LiveError::RoomLookup(format!("invalid JSON: {e}")))?;
+        let body: RoomApiResponse = match serde_json::from_str(&text) {
+            Ok(b) => b,
+            Err(e) => {
+                if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                    return Ok(room);
+                }
+                return Err(LiveError::RoomLookup(format!("invalid JSON: {e}")));
+            }
+        };
 
         if body.status_code == Some(19881007) {
             return Err(LiveError::UserNotFound(unique_id));
         }
         if let Some(code) = body.status_code.filter(|c| *c != 0) {
+            if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                return Ok(room);
+            }
             return Err(LiveError::RoomLookup(
                 body.message
                     .clone()
@@ -248,9 +268,15 @@ impl TikTokWeb {
         }
 
         let Some(data) = body.data else {
+            if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                return Ok(room);
+            }
             return Err(LiveError::RoomLookup("no user data".into()));
         };
         let Some(user) = data.user else {
+            if let Ok(room) = self.room_status_from_html(&unique_id).await {
+                return Ok(room);
+            }
             return Err(LiveError::RoomLookup("no user data".into()));
         };
 
@@ -283,6 +309,138 @@ impl TikTokWeb {
                 .and_then(|p| p.stream_data)
                 .and_then(|json| pick_hls_url(&json)),
         })
+    }
+
+    /// Fallback room lookup by requesting the HTML page `https://www.tiktok.com/@{username}/live`.
+    /// Used when the REST API is 429 rate limited or blocked.
+    pub async fn room_status_from_html(&self, username: &str) -> Result<RoomStatus> {
+        let unique_id = normalize_username(username);
+        let url = format!("https://www.tiktok.com/@{unique_id}/live");
+        let res = self
+            .client
+            .get(&url)
+            .header(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        if status == 429 {
+            return Err(LiveError::RateLimited { status: 429 });
+        }
+        if !(200..300).contains(&status) {
+            return Err(LiveError::RoomLookup(format!("HTML page HTTP {status}")));
+        }
+        let html = res.text().await?;
+        Self::parse_room_from_html(&unique_id, &html)
+    }
+
+    fn extract_room_id_from_html(html: &str) -> Option<String> {
+        let keys = ["\"roomId\":\"", "\"roomId\":", "\"room_id\":\"", "\"room_id\":"];
+        for key in keys {
+            if let Some(pos) = html.find(key) {
+                let rest = &html[pos + key.len()..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if digits.len() >= 10 {
+                    return Some(digits);
+                }
+            }
+        }
+        None
+    }
+
+    fn parse_room_from_html(unique_id: &str, html: &str) -> Result<RoomStatus> {
+        if let Some(script_start) = html.find("__UNIVERSAL_DATA_FOR_REHYDRATION__") {
+            if let Some(tag_close) = html[script_start..].find('>') {
+                let json_start = script_start + tag_close + 1;
+                if let Some(json_end) = html[json_start..].find("</script>") {
+                    let json_str = &html[json_start..json_start + json_end];
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(scope) = v.get("__DEFAULT_SCOPE__") {
+                            let live_detail = scope.get("webapp.live-detail");
+                            let user_detail = scope.get("webapp.user-detail");
+                            let room_info = live_detail
+                                .and_then(|d| d.get("liveRoom"))
+                                .or_else(|| user_detail.and_then(|d| d.get("liveRoom")));
+
+                            if let Some(live_room) = room_info {
+                                let room_id = live_room
+                                    .get("roomId")
+                                    .or_else(|| live_room.get("id"))
+                                    .and_then(|id| {
+                                        if let Some(s) = id.as_str() {
+                                            Some(s.to_string())
+                                        } else if let Some(n) = id.as_i64() {
+                                            Some(n.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_default();
+
+                                let status = live_room
+                                    .get("status")
+                                    .and_then(|s| s.as_i64())
+                                    .unwrap_or(0);
+                                let is_live = status == 2 && !room_id.is_empty();
+                                let title = live_room
+                                    .get("title")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let user_count = live_room
+                                    .get("liveRoomStats")
+                                    .and_then(|s| s.get("userCount"))
+                                    .and_then(|c| c.as_u64())
+                                    .unwrap_or(0);
+
+                                if !room_id.is_empty() {
+                                    return Ok(RoomStatus {
+                                        room_id,
+                                        is_live,
+                                        title,
+                                        viewer_count: user_count,
+                                        owner: RoomOwner {
+                                            user_id: String::new(),
+                                            unique_id: unique_id.to_string(),
+                                            nickname: unique_id.to_string(),
+                                            profile_picture_url: String::new(),
+                                            follower_count: 0,
+                                        },
+                                        stream_started_at: None,
+                                        cover_url: None,
+                                        hls_url: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(room_id) = Self::extract_room_id_from_html(html) {
+            let is_live = html.contains("\"status\":2")
+                || html.contains("\"status\": 2")
+                || html.contains("\"liveRoomStatus\":2")
+                || html.contains("\"isLive\":true");
+            return Ok(RoomStatus {
+                room_id,
+                is_live,
+                title: String::new(),
+                viewer_count: 0,
+                owner: RoomOwner {
+                    user_id: String::new(),
+                    unique_id: unique_id.to_string(),
+                    nickname: unique_id.to_string(),
+                    profile_picture_url: String::new(),
+                    follower_count: 0,
+                },
+                stream_started_at: None,
+                cover_url: None,
+                hls_url: None,
+            });
+        }
+
+        Err(LiveError::RoomLookup("could not parse room from HTML".into()))
     }
 
     /// The public gift catalog, sorted by price.
@@ -508,4 +666,25 @@ mod tests {
         let json = r#"{"data":{"hd":{"main":{"hls":"https://hd"}},"sd":{"main":{"hls":"https://sd"}},"ao":{"main":{"hls":"https://audio"}}}}"#;
         assert_eq!(pick_hls_url(json).as_deref(), Some("https://sd"));
     }
+
+    #[test]
+    fn parses_room_from_html_script_tag() {
+        let html = r#"<html><head><script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">
+            {"__DEFAULT_SCOPE__":{"webapp.live-detail":{"liveRoom":{"roomId":"7412345678901234567","status":2,"title":"Gaming Live","liveRoomStats":{"userCount":150}}}}}
+        </script></head><body></body></html>"#;
+        let room = TikTokWeb::parse_room_from_html("testuser", html).unwrap();
+        assert_eq!(room.room_id, "7412345678901234567");
+        assert!(room.is_live);
+        assert_eq!(room.title, "Gaming Live");
+        assert_eq!(room.viewer_count, 150);
+    }
+
+    #[test]
+    fn parses_room_from_html_fallback() {
+        let html = r#"<html><body><div data-info='{"roomId":"7498765432109876543","status":2}'></div></body></html>"#;
+        let room = TikTokWeb::parse_room_from_html("testuser2", html).unwrap();
+        assert_eq!(room.room_id, "7498765432109876543");
+        assert!(room.is_live);
+    }
 }
+

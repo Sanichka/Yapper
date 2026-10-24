@@ -224,9 +224,38 @@ jobs:
         working-directory: apps/tiktok-tts-app
         run: cargo tauri android init --ci
 
-      - name: Build debug APK
+      - name: Bundle Android C++ runtime and configure release signing
+        shell: bash
+        run: |
+          # Copy libc++_shared.so from NDK into jniLibs so ONNX Runtime can load on device
+          LIB_PATH=$(find "$ANDROID_HOME/ndk/$NDK_VERSION" -name "libc++_shared.so" | grep "aarch64" | head -n 1)
+          if [ -n "$LIB_PATH" ]; then
+            mkdir -p apps/tiktok-tts-app/gen/android/app/src/main/jniLibs/arm64-v8a
+            cp "$LIB_PATH" apps/tiktok-tts-app/gen/android/app/src/main/jniLibs/arm64-v8a/
+            echo "Copied $LIB_PATH to jniLibs/arm64-v8a/"
+          else
+            echo "::error::libc++_shared.so for aarch64 not found in NDK"
+            exit 1
+          fi
+
+          # Enable debug signing for release buildType so the APK is installable without an external keystore
+          python3 -c '
+          path = "apps/tiktok-tts-app/gen/android/app/build.gradle.kts"
+          with open(path, "r") as f:
+              content = f.read()
+          content = content.replace("getByName(\"release\") {", "getByName(\"release\") {\n            signingConfig = signingConfigs.getByName(\"debug\")")
+          with open(path, "w") as f:
+              f.write(content)
+          '
+
+      - name: Build release APK
         working-directory: apps/tiktok-tts-app
-        run: cargo tauri android build --apk --target aarch64 --debug --ci
+        run: |
+          cargo tauri android build --apk --target aarch64 --ci
+          APK_DIR="gen/android/app/build/outputs/apk/arm64/release"
+          if [ -f "$APK_DIR/app-arm64-release.apk" ]; then
+            mv "$APK_DIR/app-arm64-release.apk" "$APK_DIR/yapper-v${{ needs.version.outputs.version }}-arm64.apk"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

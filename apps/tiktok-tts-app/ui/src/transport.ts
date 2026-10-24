@@ -111,6 +111,18 @@ export class Transport {
       case "clear_queue":
         response = await post("/api/queue/clear", {});
         break;
+      case "get_models":
+        response = await fetch("/api/models");
+        break;
+      case "download_model":
+        response = await post("/api/models/download", { modelId: args.modelId });
+        break;
+      case "switch_model":
+        response = await post("/api/models/switch", { modelId: args.modelId });
+        break;
+      case "delete_model":
+        response = await post("/api/models/delete", { modelId: args.modelId });
+        break;
       default:
         throw new Error(`unknown command ${command}`);
     }

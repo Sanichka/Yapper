@@ -13,19 +13,24 @@ needed at runtime.
 - **Login-free TikTok LIVE client** — resolves the room, signs the WebSocket via
   EulerStream, fetches chat, and decodes protobuf messages (`WebcastChatMessage`, gifts,
   likes, members, follows, shares).
+- **HTTP 429 & connection resilience** — automatic fallback to HTML room scraping if
+  TikTok rate-limits the room API, plus exponential backoff with jitter on reconnects.
 - **Local neural TTS** — KittenTTS mini 0.8 ONNX, 24 kHz, eight expressive voices,
   adjustable speed, CPU inference.
-- **Spoken language** — choose `auto` (English / Ukrainian), English (local
-  KittenTTS), or Ukrainian (Microsoft Edge online). Chat is always shown in its
-  original script; only the spoken text is transliterated when English is active.
+- **In-app model manager** — download and activate neural models directly inside the
+  desktop or mobile UI without needing command-line tools.
+- **Spoken language & mixed-language synthesis** — choose `auto` (English / Ukrainian), English (local
+  KittenTTS), or Ukrainian (Microsoft Edge online). In `auto` mode, mixed-script sentences
+  (e.g. English + Ukrainian words) are seamlessly split, synthesized with their matching voices,
+  and chained into a unified audio utterance.
 - **Readable chat** — emote/mention stripping, URL and repeat collapsing, blacklist,
   transliteration, per-user cooldown, length limit, `{user}` / `{text}` templates.
 - **Gift announcements** — reads gift streaks with `{user}`, `{gift}`, `{count}`,
   minimum diamond filter.
 - **Bounded priority queue** — chat and gifts in two lanes, newest kept when full,
   pause / skip / clear, one utterance at a time.
-- **Two shells, one core** — native Tauri window or `--server` mode with REST + WebSocket
-  control and the same UI served over the LAN.
+- **Cross-platform** — native desktop Tauri app (Windows, macOS, Linux), Android mobile app
+  (~32 MB optimized APK), or `--server` headless LAN mode with browser dashboard.
 - **Plays everywhere** — Web Audio playback in the browser and Tauri webview; an explicit
   acknowledgement drives the queue so audio and state stay in sync.
 
@@ -48,7 +53,13 @@ models/                   Local model files (gitignored)
 
 ## Get the model
 
-Download the files from
+### Option 1: In-App Download (Recommended)
+
+In the desktop or mobile app dashboard, open the **Models** dialog from the status bar or settings. Click **Download** next to **KittenTTS mini 0.8** to fetch the ONNX weights, voice embeddings, and config automatically into your local data directory.
+
+### Option 2: Manual Download
+
+You can also download the files manually from
 [`KittenML/kitten-tts-mini-0.8`](https://huggingface.co/KittenML/kitten-tts-mini-0.8)
 into `models/kitten-tts-mini-0.8/`:
 
@@ -76,19 +87,19 @@ chat flow can still be exercised.
 
 ### Spoken language
 
-KittenTTS 0.8 only speaks English. The **Spoken language** setting chooses how chat is
+KittenTTS 0.8 natively speaks English. The **Spoken language** setting chooses how chat is
 voiced:
 
 | Setting | Behavior |
 | --- | --- |
-| `auto` (default) | Latin messages use the local Kitten voice; Cyrillic messages are spoken by a Ukrainian Edge voice. |
+| `auto` (default) | Intelligently routes languages: Latin messages use the local Kitten voice; Cyrillic messages use a Ukrainian Edge voice. Mixed sentences (e.g. *"Hello friend це гарний стрім"*) are split into language chunks and voiced with their respective engines in a single continuous utterance. |
 | `en` | Everything is spoken by the local Kitten voice (non-Latin scripts are transliterated for speech). |
 | `uk` | Everything is spoken by a Microsoft Edge Ukrainian neural voice (`Polina` / `Ostap`) over the internet — no API key, no login. |
 
 Chat is always displayed in its original script; transliteration only ever affects the
 spoken text when English is active. Ukrainian voices require a working internet
-connection. Edge voices are provided by Microsoft's public Read Aloud endpoint, so
-treat them as best-effort.
+connection (Edge Read Aloud service).
+
 
 ## Build the UI
 
@@ -168,6 +179,10 @@ All responses are the same application state object the UI renders.
 | `POST` | `/api/queue/clear` | — |
 | `POST` | `/api/queue/pause` | — |
 | `POST` | `/api/ack` | — |
+| `GET` | `/api/models` | — (returns catalog, installed status, active model) |
+| `POST` | `/api/models/download` | `{"modelId":"kitten-tts-mini-0.8"}` |
+| `POST` | `/api/models/switch` | `{"modelId":"kitten-tts-mini-0.8"}` |
+| `POST` | `/api/models/delete` | `{"modelId":"kitten-tts-mini-0.8"}` |
 | `GET` | `/ws` | WebSocket events |
 
 The WebSocket streams `state`, `activity`, `utterance` and `log` events (tagged with
@@ -227,19 +242,42 @@ Voice names are case-insensitive and include `Bella`, `Jasper`, `Luna`, `Bruno`,
 `Hugo`, `Kiki`, `Leo`, or the raw model names such as `expr-voice-2-f`. When the spoken
 language is Ukrainian, choose `uk-UA-PolinaNeural` or `uk-UA-OstapNeural`.
 
-## Android (experimental)
+## Android
 
-The intended mobile path is Tauri's Android target with a runtime-loaded ONNX Runtime:
+Yapper runs natively on Android (`arm64-v8a`) powered by Tauri v2:
 
-1. Build with `--no-default-features --features onnx-dynamic` (or add it to the feature
-   list) and ship `libonnxruntime.so` for each ABI.
-2. Point `YAPPER_ORT_DYLIB` at the library, or place it next to the app library.
-3. Add `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `INTERNET` and
-   `WAKE_LOCK` permissions to the generated manifest.
+- **Compact release size**: Release builds use LTO, symbol stripping, and resource shrinking to keep the APK around **~32 MB** while embedding full ONNX inference and Web Audio playback.
+- **In-app model download**: No manual file transfers needed. Tap the **Models** badge in the mobile UI to download KittenTTS directly to the device's internal storage over Wi-Fi.
+- **Bundled dependencies**: The APK bundles `libc++_shared.so` alongside the Rust binary to ensure smooth ONNX Runtime compatibility across Android 7.0+ (API 24+).
 
-This path is not built or tested in CI yet. The CI workflow instead builds the default
-feature set for `aarch64`, which downloads the Android ONNX Runtime binary through `ort`
-and produces a debug-signed APK.
+### Building the APK locally
+
+Prerequisites:
+- Android SDK with platform tools & NDK (r27+ recommended)
+- Java 17+ (or JDK 23)
+- `rustup target add aarch64-linux-android`
+
+Set up the environment and build:
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Java\jdk-23"
+$env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
+$env:NDK_HOME = "$env:ANDROID_HOME\ndk\27.0.12077973"
+$env:ANDROID_NDK_HOME = $env:NDK_HOME
+
+# In apps/tiktok-tts-app:
+npx -y @tauri-apps/cli android build --apk --target aarch64 --ci
+```
+
+On Windows without developer mode (symlink restrictions), copy the compiled `.so` from `target/aarch64-linux-android/release/libtiktok_tts_app_lib.so` into `apps/tiktok-tts-app/gen/android/app/src/main/jniLibs/arm64-v8a/` and run:
+
+```powershell
+cd apps/tiktok-tts-app/gen/android
+.\gradlew.bat assembleArm64Release -x rustBuildArm64Release -x rustBuildUniversalRelease
+```
+
+The resulting signed APK is saved to `apps/tiktok-tts-app/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk` (and copied to `release/yapper-v0.0.1-arm64.apk`).
+
 
 ## Releases and CI
 

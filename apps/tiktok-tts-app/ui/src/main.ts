@@ -6,6 +6,8 @@ import type {
   AppConfig,
   AppStateDto,
   ConnStatus,
+  ModelDto,
+  ModelProgressEvent,
   ServerEvent,
   TtsSettings,
 } from "./types";
@@ -48,6 +50,10 @@ let playing: { id: number; durationMs: number } | null = null;
 let currentSeq: number | null = null;
 let lastStatus: ConnStatus | null = null;
 let toastTimer: number | undefined;
+const downloadingModels: Record<string, ModelProgressEvent> = {};
+let modelsExpanded = false;
+let switchingModelId: string | null = null;
+let deletingModelId: string | null = null;
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("missing #app");
@@ -91,6 +97,17 @@ function onEvent(event: ServerEvent): void {
       } else {
         console.info("[yapper]", event.message);
       }
+      break;
+    case "modelProgress":
+      downloadingModels[event.modelId] = { ...event };
+      if (event.status === "complete") {
+        toast(`Model ${event.modelId} ready!`);
+        delete downloadingModels[event.modelId];
+      } else if (event.status === "error") {
+        toast(`Download failed: ${event.message || "Unknown error"}`, "error");
+        delete downloadingModels[event.modelId];
+      }
+      renderModels();
       break;
   }
 }
@@ -316,6 +333,193 @@ function renderVoice(): void {
   $("#speed-value").textContent = `${Number(
     settingsDirty ? speed.value : state.settings.speed,
   ).toFixed(2)}×`;
+  renderModels();
+}
+
+function renderModels(): void {
+  if (!state) return;
+  const list = $("#models-list");
+  const section = $("#models-section");
+  const summaryBadge = $("#models-summary-badge");
+  const warningBanner = $("#models-warning-banner");
+  const toggleBtn = $<HTMLButtonElement>("#models-toggle-btn");
+  const toggleText = $("#models-toggle-text");
+
+  const language =
+    settingsDirty
+      ? ($<HTMLSelectElement>("#language").value as string)
+      : state.settings.language;
+
+  const isLocalSupported = language !== LANGUAGE_UK;
+  section.classList.toggle("hidden", !isLocalSupported);
+  if (!isLocalSupported) return;
+
+  const models = state.models || [];
+  const installedCount = models.filter((m) => m.installed).length;
+  const isMock = state.engine.kind === "mock";
+  const activeModel = models.find((m) => m.active);
+
+  if (isMock && !modelsExpanded && toggleBtn.dataset.manuallyToggled !== "true") {
+    modelsExpanded = true;
+  }
+
+  summaryBadge.textContent = activeModel
+    ? activeModel.name
+    : `${installedCount}/${models.length} installed`;
+  summaryBadge.className = `badge ${activeModel ? "badge-mint" : isMock ? "badge-amber" : "badge-muted"}`;
+
+  warningBanner.classList.toggle("hidden", !isMock);
+  list.classList.toggle("hidden", !modelsExpanded);
+  toggleBtn.classList.toggle("active", modelsExpanded);
+  toggleText.textContent = modelsExpanded ? "Hide" : "Manage";
+
+  if (!modelsExpanded) return;
+
+  list.innerHTML = models
+    .map((m) => {
+      const dl = downloadingModels[m.id];
+      const isDownloading = !!dl;
+      const isSwitching = switchingModelId === m.id;
+      const isDeleting = deletingModelId === m.id;
+
+      let statusBadge = "";
+      if (m.active) {
+        statusBadge = `<span class="badge badge-mint">Active</span>`;
+      } else if (m.installed) {
+        const sizeStr = m.diskSizeBytes
+          ? `${(m.diskSizeBytes / (1024 * 1024)).toFixed(0)} MB`
+          : `${m.approxSizeMb} MB`;
+        statusBadge = `<span class="badge badge-muted">Installed · ${sizeStr}</span>`;
+      } else {
+        statusBadge = `<span class="badge badge-muted">${m.approxSizeMb} MB</span>`;
+      }
+
+      let actionsHtml = "";
+      if (isDownloading) {
+        actionsHtml = `
+          <div class="model-progress">
+            <div class="model-progress-header">
+              <span class="model-progress-file">${esc(dl?.currentFile || "Downloading…")}</span>
+              <span class="model-progress-percent">${(dl?.percent ?? 0).toFixed(0)}%</span>
+            </div>
+            <div class="progress-bar-track">
+              <div class="progress-bar-fill" style="width: ${dl?.percent ?? 0}%"></div>
+            </div>
+            <span class="model-progress-msg">${esc(dl?.message || "Downloading model files…")}</span>
+          </div>`;
+      } else if (m.active) {
+        actionsHtml = `<span class="model-status-text">Active voice engine</span>`;
+      } else if (m.installed) {
+        actionsHtml = `
+          <div class="model-actions">
+            <button class="btn btn-sm btn-primary model-activate-btn" data-id="${esc(m.id)}" ${isSwitching ? "disabled" : ""}>
+              ${isSwitching ? "Switching…" : "Use"}
+            </button>
+            <button class="btn btn-sm btn-ghost btn-danger-ghost model-delete-btn" data-id="${esc(m.id)}" ${isDeleting ? "disabled" : ""}>
+              ${isDeleting ? "…" : "Delete"}
+            </button>
+          </div>`;
+      } else {
+        actionsHtml = `
+          <div class="model-actions">
+            <button class="btn btn-sm btn-primary model-download-btn" data-id="${esc(m.id)}">
+              Download (${m.approxSizeMb} MB)
+            </button>
+          </div>`;
+      }
+
+      return `
+        <div class="model-card ${m.active ? "model-card-active" : ""}">
+          <div class="model-card-head">
+            <div class="model-title-row">
+              <span class="model-name">${esc(m.name)}</span>
+              ${statusBadge}
+            </div>
+            <p class="model-desc">${esc(m.description)}</p>
+          </div>
+          <div class="model-card-body">
+            ${actionsHtml}
+          </div>
+        </div>`;
+    })
+    .join("");
+
+  list.querySelectorAll<HTMLButtonElement>(".model-download-btn").forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (id) void downloadModel(id);
+    };
+  });
+
+  list.querySelectorAll<HTMLButtonElement>(".model-activate-btn").forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (id) void switchModel(id);
+    };
+  });
+
+  list.querySelectorAll<HTMLButtonElement>(".model-delete-btn").forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (id && confirm(`Delete model "${id}" from this device?`)) {
+        void deleteModel(id);
+      }
+    };
+  });
+}
+
+async function downloadModel(modelId: string): Promise<void> {
+  downloadingModels[modelId] = {
+    modelId,
+    status: "downloading",
+    percent: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+    currentFile: "Connecting…",
+    message: "Starting download…",
+  };
+  renderModels();
+  try {
+    toast(`Downloading ${modelId}…`);
+    await transport.call("download_model", { modelId });
+  } catch (err) {
+    delete downloadingModels[modelId];
+    renderModels();
+    toast(`Failed to download ${modelId}: ${message(err)}`, "error");
+  }
+}
+
+async function switchModel(modelId: string): Promise<void> {
+  switchingModelId = modelId;
+  renderModels();
+  try {
+    const updated = await transport.call<AppStateDto>("switch_model", { modelId });
+    if (updated) applyState(updated);
+    toast(`Activated ${modelId}`);
+  } catch (err) {
+    toast(`Failed to switch to ${modelId}: ${message(err)}`, "error");
+  } finally {
+    switchingModelId = null;
+    renderModels();
+  }
+}
+
+async function deleteModel(modelId: string): Promise<void> {
+  deletingModelId = modelId;
+  renderModels();
+  try {
+    const updated = await transport.call<AppStateDto>("delete_model", { modelId });
+    if (updated) applyState(updated);
+    toast(`Deleted ${modelId}`);
+  } catch (err) {
+    toast(`Failed to delete ${modelId}: ${message(err)}`, "error");
+  } finally {
+    deletingModelId = null;
+    renderModels();
+  }
 }
 
 function renderSettings(force: boolean): void {
@@ -476,6 +680,12 @@ function bind(): void {
   $("#test-form").addEventListener("submit", (event) => {
     event.preventDefault();
     void speakTest();
+  });
+
+  $("#models-toggle-btn").addEventListener("click", () => {
+    modelsExpanded = !modelsExpanded;
+    $<HTMLButtonElement>("#models-toggle-btn").dataset.manuallyToggled = "true";
+    renderModels();
   });
 
   $("#pause-btn").addEventListener("click", () => {
@@ -913,6 +1123,26 @@ function shell(): string {
         </div>
         <p id="language-note" class="note hidden"></p>
         <p id="engine-note" class="note hidden"></p>
+        <div id="models-section" class="models-section">
+          <div class="models-header">
+            <div class="models-header-left">
+              <span class="models-title">Local speech models</span>
+              <span id="models-summary-badge" class="badge badge-muted">models</span>
+            </div>
+            <button id="models-toggle-btn" class="btn btn-ghost btn-sm" type="button">
+              <span id="models-toggle-text">Manage</span>
+              <span class="chevron">▾</span>
+            </button>
+          </div>
+          <div id="models-warning-banner" class="models-warning-banner hidden">
+            <span class="warning-icon">⚠</span>
+            <div class="warning-text">
+              <strong>Mock voice active</strong>
+              <p>Download a KittenTTS model below to enable real neural voice synthesis on this device.</p>
+            </div>
+          </div>
+          <div id="models-list" class="models-list"></div>
+        </div>
         <form id="test-form" class="test-form">
           <input id="test-text" class="input" placeholder="Test the voice…" maxlength="150">
           <button class="btn" type="submit">Speak</button>

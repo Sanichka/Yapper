@@ -47,7 +47,11 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/queue/skip", post(skip))
         .route("/queue/clear", post(clear))
         .route("/queue/pause", post(pause))
-        .route("/ack", post(ack));
+        .route("/ack", post(ack))
+        .route("/models", get(get_models))
+        .route("/models/download", post(download_model))
+        .route("/models/switch", post(switch_model))
+        .route("/models/delete", post(delete_model));
 
     let mut router = Router::new()
         .nest("/api", api)
@@ -145,6 +149,44 @@ struct AckRequest {
 async fn ack(State(core): State<Arc<Core>>, Json(request): Json<AckRequest>) -> StatusCode {
     core.ack(request.seq);
     StatusCode::NO_CONTENT
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelActionRequest {
+    model_id: String,
+}
+
+async fn get_models(State(core): State<Arc<Core>>) -> Json<Vec<crate::models::ModelDto>> {
+    Json(core.get_models())
+}
+
+async fn download_model(
+    State(core): State<Arc<Core>>,
+    Json(request): Json<ModelActionRequest>,
+) -> ApiResult {
+    core.download_model(request.model_id)
+        .await
+        .map_err(ApiError::bad)?;
+    Ok(Json(core.state()))
+}
+
+async fn switch_model(
+    State(core): State<Arc<Core>>,
+    Json(request): Json<ModelActionRequest>,
+) -> ApiResult {
+    core.switch_model(&request.model_id)
+        .map_err(ApiError::bad)?;
+    Ok(Json(core.state()))
+}
+
+async fn delete_model(
+    State(core): State<Arc<Core>>,
+    Json(request): Json<ModelActionRequest>,
+) -> ApiResult {
+    core.delete_model(&request.model_id)
+        .map_err(ApiError::bad)?;
+    Ok(Json(core.state()))
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(core): State<Arc<Core>>) -> impl IntoResponse {

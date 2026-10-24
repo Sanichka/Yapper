@@ -69,6 +69,30 @@ fn ack(core: AppCore<'_>, seq: u64) {
     core.ack(seq);
 }
 
+#[tauri::command]
+fn get_models(core: AppCore<'_>) -> Vec<crate::models::ModelDto> {
+    core.get_models()
+}
+
+#[tauri::command]
+async fn download_model(core: AppCore<'_>, model_id: String) -> Result<AppStateDto, String> {
+    let core = core.inner().clone();
+    core.download_model(model_id).await?;
+    Ok(core.state())
+}
+
+#[tauri::command]
+fn switch_model(core: AppCore<'_>, model_id: String) -> Result<AppStateDto, String> {
+    core.switch_model(&model_id)?;
+    Ok(core.state())
+}
+
+#[tauri::command]
+fn delete_model(core: AppCore<'_>, model_id: String) -> Result<AppStateDto, String> {
+    core.delete_model(&model_id)?;
+    Ok(core.state())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -123,6 +147,10 @@ pub fn run() {
             clear_queue,
             set_paused,
             ack,
+            get_models,
+            download_model,
+            switch_model,
+            delete_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Yapper");

@@ -254,11 +254,23 @@ async fn run(
             &mut explicit_room_id,
             &mut seen,
             &mut ever_connected,
+            &mut failures,
             refresh_ttwid,
             &tx,
             &shutdown,
         )
         .await;
+
+        let is_rate_limited = match &result {
+            Err(AttemptError::Request(err)) => matches!(classify(err), ErrorKind::RateLimited),
+            _ => false,
+        };
+        let base_delay_ms = if is_rate_limited { 3000u64 } else { 1000u64 };
+        let base = base_delay_ms.saturating_mul(1u64 << failures.min(16));
+        let capped = base.min(options.max_delay.as_millis() as u64);
+        let jitter = 0.8 + rand::random::<f64>() * 0.4;
+        let delay = Duration::from_millis((capped as f64 * jitter) as u64);
+        let will_reconnect = options.reconnect && failures < options.max_attempts;
 
         match result {
             Ok(SocketEnd::StreamEnd) => {
@@ -298,46 +310,88 @@ async fn run(
                 return;
             }
             Err(AttemptError::Request(err)) => {
-                if !ever_connected {
+                let kind = classify(&err);
+                let is_fatal = matches!(kind, ErrorKind::NotFound | ErrorKind::Offline);
+                if is_fatal {
                     emit(
                         &tx,
                         ConnectionEvent::Error {
-                            kind: classify(&err),
+                            kind,
                             message: err.to_string(),
                         },
                     )
                     .await;
                     return;
                 }
-                warn!("room/cookie request failed after connect: {err}");
-                refresh_ttwid = true;
-            }
-            Err(AttemptError::Open(detail)) => {
-                if !ever_connected {
+                if !will_reconnect {
                     emit(
                         &tx,
                         ConnectionEvent::Error {
-                            kind: ErrorKind::Network,
-                            message: format!("could not open the TikTok socket: {detail}"),
+                            kind,
+                            message: format!("connection failed after {failures} attempts: {err}"),
                         },
                     )
                     .await;
                     return;
                 }
-                warn!("socket open failed: {detail}");
-                refresh_ttwid = true;
-            }
-            Err(AttemptError::Dropped(detail)) => {
-                let will_reconnect = options.reconnect && failures < options.max_attempts;
+                let detail = match kind {
+                    ErrorKind::RateLimited => format!(
+                        "Rate limited by TikTok (HTTP 429). Retrying in {:.0}s (attempt {} of {})...",
+                        delay.as_secs_f32().max(1.0),
+                        failures + 1,
+                        options.max_attempts
+                    ),
+                    _ => format!(
+                        "Room lookup failed: {err}. Retrying in {:.0}s (attempt {} of {})...",
+                        delay.as_secs_f32().max(1.0),
+                        failures + 1,
+                        options.max_attempts
+                    ),
+                };
                 emit(
                     &tx,
                     ConnectionEvent::Disconnected {
                         reason: DisconnectReason::Network,
-                        will_reconnect,
-                        detail: Some(detail.clone()),
+                        will_reconnect: true,
+                        detail: Some(detail),
                     },
                 )
                 .await;
+                warn!("room/cookie request failed: {err}");
+                refresh_ttwid = true;
+            }
+            Err(AttemptError::Open(detail)) => {
+                if !will_reconnect {
+                    emit(
+                        &tx,
+                        ConnectionEvent::Error {
+                            kind: ErrorKind::Network,
+                            message: format!(
+                                "could not open the TikTok socket after {failures} attempts: {detail}"
+                            ),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                emit(
+                    &tx,
+                    ConnectionEvent::Disconnected {
+                        reason: DisconnectReason::Network,
+                        will_reconnect: true,
+                        detail: Some(format!(
+                            "Could not open TikTok socket: {detail}. Retrying in {:.0}s (attempt {} of {})...",
+                            delay.as_secs_f32().max(1.0),
+                            failures + 1,
+                            options.max_attempts
+                        )),
+                    },
+                )
+                .await;
+                warn!("socket open failed: {detail}");
+                refresh_ttwid = true;
+            }
+            Err(AttemptError::Dropped(detail)) => {
                 if !will_reconnect {
                     emit(
                         &tx,
@@ -351,17 +405,27 @@ async fn run(
                     .await;
                     return;
                 }
+                emit(
+                    &tx,
+                    ConnectionEvent::Disconnected {
+                        reason: DisconnectReason::Network,
+                        will_reconnect: true,
+                        detail: Some(format!(
+                            "Connection dropped: {detail}. Reconnecting in {:.0}s (attempt {} of {})...",
+                            delay.as_secs_f32().max(1.0),
+                            failures + 1,
+                            options.max_attempts
+                        )),
+                    },
+                )
+                .await;
             }
         }
 
-        if !(options.reconnect && failures < options.max_attempts) {
+        if !will_reconnect {
             return;
         }
 
-        let base = 1000u64.saturating_mul(1u64 << failures.min(16));
-        let capped = base.min(options.max_delay.as_millis() as u64);
-        let jitter = 0.8 + rand::random::<f64>() * 0.4;
-        let delay = Duration::from_millis((capped as f64 * jitter) as u64);
         failures += 1;
         debug!("reconnecting in {delay:?} (attempt {failures})");
 
@@ -381,6 +445,7 @@ async fn attempt(
     explicit_room_id: &mut Option<String>,
     seen: &mut RecentIds,
     ever_connected: &mut bool,
+    failures: &mut u32,
     refresh_ttwid: bool,
     tx: &mpsc::Sender<ConnectionEvent>,
     shutdown: &Arc<Notify>,
@@ -462,6 +527,7 @@ async fn attempt(
         options,
         seen,
         ever_connected,
+        failures,
         tx,
         shutdown,
     )
@@ -477,6 +543,7 @@ async fn run_socket(
     options: &ConnectOptions,
     seen: &mut RecentIds,
     ever_connected: &mut bool,
+    failures: &mut u32,
     tx: &mpsc::Sender<ConnectionEvent>,
     shutdown: &Arc<Notify>,
 ) -> Result<SocketEnd, AttemptError> {
@@ -537,6 +604,7 @@ async fn run_socket(
         .map_err(|e| AttemptError::Dropped(format!("enter room failed: {e}")))?;
 
     *ever_connected = true;
+    *failures = 0;
     emit(
         tx,
         ConnectionEvent::Connected {

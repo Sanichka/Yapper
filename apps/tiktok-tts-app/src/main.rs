@@ -12,13 +12,13 @@ fn main() {
     {
         let server_mode = std::env::args().skip(1).any(|arg| arg == "--server");
         if server_mode {
-            tiktok_tts_app::run_server();
+            tiktok_tts_app_lib::run_server();
         } else {
-            tiktok_tts_app::run();
+            tiktok_tts_app_lib::run();
         }
     }
     #[cfg(not(feature = "desktop"))]
     {
-        tiktok_tts_app::run_server();
+        tiktok_tts_app_lib::run_server();
     }
 }
