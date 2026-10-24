@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: yapper-build
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -267,7 +267,7 @@ jobs:
   release:
     name: GitHub release
     needs: [version, desktop, android]
-    if: startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.should_build == 'true'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && needs.version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
