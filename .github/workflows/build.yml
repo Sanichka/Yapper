@@ -151,6 +151,7 @@ jobs:
         working-directory: apps/tiktok-tts-app
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.4"
+          RUSTFLAGS: "-C link-arg=-mmacosx-version-min=13.4"
         run: |
           set -o pipefail
           cargo tauri build --bundles ${{ matrix.bundles }} --ci 2>&1 | tee tauri-build.log

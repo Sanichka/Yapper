@@ -1,0 +1,10 @@
+{
+  "name": "yapper-app",
+  "version": "0.0.2",
+  "private": true,
+  "scripts": {
+    "tauri": "cargo tauri",
+    "dev": "npm --prefix ui run dev",
+    "build": "npm --prefix ui run build"
+  }
+}
