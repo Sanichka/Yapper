@@ -36,7 +36,7 @@ jobs:
           cargo build --release
 
       - name: Start Browser VNC Session (macOS + iOS Simulator)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macos'
         env:
           VNC_USER: runner
           VNC_PASS: yappertest
@@ -45,8 +45,9 @@ jobs:
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
           git clone --depth 1 https://github.com/novnc/websockify /tmp/novnc/utils/websockify
 
-          # Явно задаємо пароль для системного користувача
-          sudo dscl . -passwd /Users/$VNC_USER $VNC_PASS
+          # Коректна зміна пароля під sudo без запиту старого
+          sudo dscl . -passwd /Users/$VNC_USER "" || true
+          sudo dscl . -passwd /Users/$VNC_USER "" $VNC_PASS
           sudo dseditgroup -o edit -a $VNC_USER -t user admin || true
 
           # Увімкнення Remote Management (VNC) для цього користувача
