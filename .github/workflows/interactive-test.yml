@@ -22,6 +22,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Build Yapper UI & Binary (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -31,8 +34,9 @@ jobs:
       - name: Start Browser VNC Session (macOS + iOS Simulator)
         if: runner.os == 'macOS'
         run: |
-          brew install cloudflared novnc websockify
-          
+          brew install cloudflared websockify
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+
           # Enable macOS VNC server with password "yappertest"
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
@@ -46,7 +50,7 @@ jobs:
           ./target/release/tiktok-tts-app &
 
           # Bridge VNC (5900) to Web HTTP (6080) via noVNC
-          websockify --web=/opt/homebrew/share/novnc 6080 localhost:5900 &
+          websockify --web=/tmp/novnc 6080 localhost:5900 &
           sleep 2
 
           echo "=========================================="
@@ -60,7 +64,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb fluxbox x11vnc novnc websockify libwebkit2gtk-4.1-dev libasound2-dev
-          
+
           cd apps/tiktok-tts-app/ui && npm ci && npm run build
           cargo build --release
 
