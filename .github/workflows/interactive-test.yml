@@ -24,6 +24,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "yapper-workspace"
+          prefix-key: "rust"
 
       - name: Build Yapper UI & Binary (macOS)
         if: runner.os == 'macOS'
@@ -34,26 +37,35 @@ jobs:
 
       - name: Start Browser VNC Session (macOS + iOS Simulator)
         if: runner.os == 'macOS'
+        env:
+          VNC_USER: runner
+          VNC_PASS: yappertest
         run: |
           brew install cloudflared
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
           git clone --depth 1 https://github.com/novnc/websockify /tmp/novnc/utils/websockify
 
-          # Налаштовуємо VNC сервер БЕЗ патріольнї авторизації для локального підключення
-          sudo defaults write /Library/Preferences/com.apple.VNCSettings.txt DVCAuthRequired -bool false
+          # Явно задаємо пароль для системного користувача
+          sudo dscl . -passwd /Users/$VNC_USER $VNC_PASS
+          sudo dseditgroup -o edit -a $VNC_USER -t user admin || true
+
+          # Увімкнення Remote Management (VNC) для цього користувача
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -restart -agent -privs -all
+            -activate -configure -access -on \
+            -restart -agent -privs -all
 
           # Запуск симулятора та Yapper
           xcrun simctl boot "iPhone 16" || xcrun simctl boot "iPhone 15" || true
           open -a Simulator
           ./target/release/tiktok-tts-app &
 
-          # Запуск noVNC проксі на порту 6080 без вимогою пароля
+          # Запуск noVNC проксі
           /tmp/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 6080 &
           sleep 3
 
           echo "=========================================="
+          echo "VNC Username: $VNC_USER"
+          echo "VNC Password: $VNC_PASS"
           echo "OPEN THE .trycloudflare.com LINK AND ADD /vnc.html"
           echo "=========================================="
           cloudflared tunnel --url http://localhost:6080
