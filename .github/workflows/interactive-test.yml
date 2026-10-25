@@ -1,0 +1,48 @@
+name: Interactive GUI Test (macOS / iOS / Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Target OS to test'
+        required: true
+        default: 'macos-14'
+        type: choice
+        options:
+          - macos-14
+          - ubuntu-latest
+
+jobs:
+  remote-gui:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust & Tauri CLI
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+
+      - name: Build Yapper (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd apps/tiktok-tts-app/ui && npm ci && npm run build
+          cargo build --release
+
+      - name: Start Interactive VNC Session via Cloudflare Tunnel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask vnc-viewer
+          brew install cloudflared
+          # Enable macOS Screen Sharing / VNC password "yappertest"
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw yappertest \
+            -restart -agent -privs -all
+          # Boot iOS Simulator automatically on desktop
+          xcrun simctl boot "iPhone 15" || true
+          open -a Simulator
+          # Expose VNC over free temporary Cloudflare link
+          cloudflared tunnel --url tcp://localhost:5900
