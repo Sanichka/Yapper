@@ -28,14 +28,16 @@ jobs:
       - name: Build Yapper UI & Binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          cd apps/tiktok-tts-app/ui && npm ci && npm run build
+          npm --prefix apps/tiktok-tts-app/ui ci
+          npm --prefix apps/tiktok-tts-app/ui run build
           cargo build --release
 
       - name: Start Browser VNC Session (macOS + iOS Simulator)
         if: runner.os == 'macOS'
         run: |
-          brew install cloudflared websockify
+          brew install cloudflared
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/novnc
+          git clone --depth 1 https://github.com/novnc/websockify /tmp/novnc/utils/websockify
 
           # Enable macOS VNC server with password "yappertest"
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
@@ -49,9 +51,9 @@ jobs:
           open -a Simulator
           ./target/release/tiktok-tts-app &
 
-          # Bridge VNC (5900) to Web HTTP (6080) via noVNC
-          websockify --web=/tmp/novnc 6080 localhost:5900 &
-          sleep 2
+          # Bridge VNC (5900) to Web HTTP (6080) using built-in novnc_proxy
+          /tmp/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 6080 &
+          sleep 3
 
           echo "=========================================="
           echo "OPEN THE .trycloudflare.com LINK BELOW AND APPEND /vnc.html"
@@ -65,7 +67,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb fluxbox x11vnc novnc websockify libwebkit2gtk-4.1-dev libasound2-dev
 
-          cd apps/tiktok-tts-app/ui && npm ci && npm run build
+          npm --prefix apps/tiktok-tts-app/ui ci
+          npm --prefix apps/tiktok-tts-app/ui run build
           cargo build --release
 
           export DISPLAY=:99
