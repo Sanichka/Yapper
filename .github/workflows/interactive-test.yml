@@ -10,39 +10,69 @@ on:
         type: choice
         options:
           - macos-14
-          - ubuntu-latest
+          - ubuntu-24.04
 
 jobs:
   remote-gui:
     runs-on: ${{ inputs.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Rust & Tauri CLI
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios, aarch64-apple-ios-sim
 
-      - name: Build Yapper (macOS)
+      - name: Build Yapper UI & Binary (macOS)
         if: runner.os == 'macOS'
         run: |
           cd apps/tiktok-tts-app/ui && npm ci && npm run build
           cargo build --release
 
-      - name: Start Interactive VNC Session via Cloudflare Tunnel (macOS)
+      - name: Start Browser VNC Session (macOS + iOS Simulator)
         if: runner.os == 'macOS'
         run: |
-          brew install --cask vnc-viewer
-          brew install cloudflared
-          # Enable macOS Screen Sharing / VNC password "yappertest"
+          brew install cloudflared novnc websockify
+          
+          # Enable macOS VNC server with password "yappertest"
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -clientopts -setvnclegacy -vnclegacy yes \
             -clientopts -setvncpw -vncpw yappertest \
             -restart -agent -privs -all
-          # Boot iOS Simulator automatically on desktop
-          xcrun simctl boot "iPhone 15" || true
+
+          # Launch iOS Simulator & built Yapper app on Desktop
+          xcrun simctl boot "iPhone 16" || xcrun simctl boot "iPhone 15" || true
           open -a Simulator
-          # Expose VNC over free temporary Cloudflare link
-          cloudflared tunnel --url tcp://localhost:5900
+          ./target/release/tiktok-tts-app &
+
+          # Bridge VNC (5900) to Web HTTP (6080) via noVNC
+          websockify --web=/opt/homebrew/share/novnc 6080 localhost:5900 &
+          sleep 2
+
+          echo "=========================================="
+          echo "OPEN THE .trycloudflare.com LINK BELOW AND APPEND /vnc.html"
+          echo "Password: yappertest"
+          echo "=========================================="
+          cloudflared tunnel --url http://localhost:6080
+
+      - name: Start Browser VNC Session (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fluxbox x11vnc novnc websockify libwebkit2gtk-4.1-dev libasound2-dev
+          
+          cd apps/tiktok-tts-app/ui && npm ci && npm run build
+          cargo build --release
+
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x800x24 &
+          sleep 2
+          fluxbox &
+          ./target/release/tiktok-tts-app &
+
+          x11vnc -display :99 -nopw -forever -shared -bg -rfbport 5900
+          websockify --web=/usr/share/novnc 6080 localhost:5900 &
+
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://localhost:6080
