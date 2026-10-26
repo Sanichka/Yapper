@@ -115,7 +115,7 @@ jobs:
       - name: Start Browser VNC Session (macOS + iOS Simulator)
         if: runner.os == 'macOS'
         env:
-          VNC_USER: runner
+          VNC_USER: vncuser
           VNC_PASS: yapper12
         run: |
           # 1. Install cloudflared and clone noVNC-ARD (supports macOS Screen Sharing / ARD protocol)
@@ -128,9 +128,52 @@ jobs:
           cp /tmp/novnc/ard.html /tmp/novnc/vnc.html
           cp /tmp/novnc/ard.html /tmp/novnc/index.html
 
-          # 2. Reset runner user password via dscl under sudo
-          sudo dscl . -passwd /Users/"$VNC_USER" "$VNC_PASS" || true
+          # Inject parameter normalizer script into HTML heads:
+          # Auto-fills username, handles 'pass'/'pwd', replaces GitHub log-masked '***' with true password,
+          # and ensures autoconnect + ardSessionType=share are set before noVNC initializes.
+          python3 -c "
+          import os
+          script = '''<script>
+          const p = new URLSearchParams(window.location.search);
+          let c = false;
+          if (!p.get('username')) { p.set('username', '${VNC_USER}'); c = true; }
+          if (!p.get('password') || p.get('password') === '***') { p.set('password', p.get('pass') || p.get('pwd') || '${VNC_PASS}'); c = true; }
+          if (!p.get('autoconnect')) { p.set('autoconnect', 'true'); c = true; }
+          if (!p.get('ardSessionType')) { p.set('ardSessionType', 'share'); c = true; }
+          if (c && window.history.replaceState) { window.history.replaceState({}, '', window.location.pathname + '?' + p.toString()); }
+          </script>'''
+          for fpath in ['/tmp/novnc/ard.html', '/tmp/novnc/vnc.html', '/tmp/novnc/index.html']:
+              if os.path.exists(fpath):
+                  with open(fpath, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  if '<head>' in content and 'ardSessionType' not in content:
+                      content = content.replace('<head>', '<head>\n' + script)
+                      with open(fpath, 'w', encoding='utf-8') as f:
+                          f.write(content)
+          "
+
+          # 2. Create fresh local admin user with known password (avoids eDSAuthFailed on runner)
+          echo "Setting up dedicated local user '$VNC_USER'..."
+          sudo dscl . -delete /Users/"$VNC_USER" 2>/dev/null || true
+          sudo dscl . -create /Users/"$VNC_USER"
+          sudo dscl . -create /Users/"$VNC_USER" UserShell /bin/bash
+          sudo dscl . -create /Users/"$VNC_USER" RealName "VNC User"
+          sudo dscl . -create /Users/"$VNC_USER" UniqueID 1001
+          sudo dscl . -create /Users/"$VNC_USER" PrimaryGroupID 80
+          sudo dscl . -create /Users/"$VNC_USER" NFSHomeDirectory /Users/"$VNC_USER"
+          sudo dscl . -passwd /Users/"$VNC_USER" "$VNC_PASS"
           sudo dseditgroup -o edit -a "$VNC_USER" -t user admin || true
+          sudo dscl . -append /Groups/admin GroupMembership "$VNC_USER" || true
+          sudo createhomedir -c -u "$VNC_USER" >/dev/null 2>&1 || true
+
+          # Verify authentication locally
+          echo "Verifying local authentication for $VNC_USER..."
+          if sudo dscl . -authonly "$VNC_USER" "$VNC_PASS"; then
+            echo "✅ Local authentication check succeeded for $VNC_USER"
+          else
+            echo "⚠️ Local authentication check failed, reapplying passwd..."
+            sudo dscl . -passwd /Users/"$VNC_USER" "$VNC_PASS"
+          fi
 
           # 3. Enable launchd screensharing daemon explicitly
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
@@ -143,9 +186,9 @@ jobs:
           # 5. Activate Apple Remote Desktop with legacy VNC and access for all users
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
+            -configure -users "$VNC_USER",runner -privs -all \
             -configure -allowAccessFor -allUsers -privs -all \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw "$VNC_PASS" \
+            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" \
             -restart -agent -console
 
           # 6. Verify local VNC port 5900 is listening
@@ -158,8 +201,16 @@ jobs:
             sleep 1
           done
 
-          # 7. Boot iOS Simulator and launch Yapper
-          xcrun simctl boot "iPhone 16" || xcrun simctl boot "iPhone 15" || true
+          # 7. Boot available iOS Simulator and launch Yapper
+          echo "Detecting available iOS simulator..."
+          SIMULATOR_UDID=$(xcrun simctl list devices available | grep -E 'iPhone|iPad' | grep -v 'unavailable' | head -n 1 | awk -F '[()]' '{print $(NF-1)}' || true)
+          if [ -n "$SIMULATOR_UDID" ]; then
+            echo "Booting simulator with UDID: $SIMULATOR_UDID"
+            xcrun simctl boot "$SIMULATOR_UDID" || true
+          else
+            echo "No specific iPhone simulator found, attempting boot by name"
+            xcrun simctl boot "iPhone 16" || xcrun simctl boot "iPhone 15" || true
+          fi
           open -a Simulator || true
           ./tiktok-tts-app &
 
@@ -198,8 +249,8 @@ jobs:
           done
 
           if [ -n "$TUNNEL_URL" ]; then
-            ONE_CLICK_URL="${TUNNEL_URL}/ard.html?autoconnect=true&ardSessionType=share&username=${VNC_USER}&password=${VNC_PASS}"
-            FALLBACK_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&ardSessionType=share&username=${VNC_USER}&password=${VNC_PASS}"
+            ONE_CLICK_URL="${TUNNEL_URL}/ard.html?autoconnect=true&ardSessionType=share&username=${VNC_USER}&pass=${VNC_PASS}"
+            FALLBACK_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&ardSessionType=share&username=${VNC_USER}&pass=${VNC_PASS}"
             echo "================================================================================"
             echo "🎉 INTERACTIVE GUI SESSION IS READY (macOS)!"
             echo ""
@@ -211,6 +262,13 @@ jobs:
             echo "   VNC Password: $VNC_PASS"
             echo "   Session timeout: 25 minutes (auto-closes if unattended)"
             echo "================================================================================"
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              echo "### 🖥️ Interactive GUI Session is Live (macOS)!" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Direct One-Click URL**: [$ONE_CLICK_URL]($ONE_CLICK_URL)" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **VNC Username**: \`$VNC_USER\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **VNC Password**: \`$VNC_PASS\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Fallback URL**: [$FALLBACK_URL]($FALLBACK_URL)" >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
             echo "::warning::Cloudflare tunnel URL could not be detected. Showing cloudflared log:"
             cat /tmp/cloudflared.log || true
@@ -287,7 +345,7 @@ jobs:
             sleep 1
           done
 
-          # 7. Ensure vnc.html exists in novnc web directory
+          # 7. Ensure vnc.html exists in novnc web directory and inject auto-auth helper
           NOVNC_DIR="/usr/share/novnc"
           if [ -d "$NOVNC_DIR" ] && [ ! -f "$NOVNC_DIR/vnc.html" ]; then
             if [ -f "$NOVNC_DIR/vnc_lite.html" ]; then
@@ -296,6 +354,26 @@ jobs:
               sudo cp "$NOVNC_DIR/index.html" "$NOVNC_DIR/vnc.html" || true
             fi
           fi
+
+          # Inject parameter normalizer script to avoid password masking
+          sudo python3 -c "
+          import os
+          script = '''<script>
+          const p = new URLSearchParams(window.location.search);
+          let c = false;
+          if (!p.get('password') || p.get('password') === '***') { p.set('password', p.get('pass') || p.get('pwd') || '${VNC_PASS}'); c = true; }
+          if (!p.get('autoconnect')) { p.set('autoconnect', 'true'); c = true; }
+          if (c && window.history.replaceState) { window.history.replaceState({}, '', window.location.pathname + '?' + p.toString()); }
+          </script>'''
+          for fpath in ['$NOVNC_DIR/vnc.html', '$NOVNC_DIR/index.html', '$NOVNC_DIR/vnc_lite.html']:
+              if os.path.exists(fpath):
+                  with open(fpath, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  if '<head>' in content and 'URLSearchParams' not in content:
+                      content = content.replace('<head>', '<head>\n' + script)
+                      with open(fpath, 'w', encoding='utf-8') as f:
+                          f.write(content)
+          " 2>/dev/null || true
 
           # 8. Start websockify proxy for noVNC on port 6080
           websockify --web="$NOVNC_DIR" 6080 127.0.0.1:5900 &
@@ -331,7 +409,7 @@ jobs:
           done
 
           if [ -n "$TUNNEL_URL" ]; then
-            ONE_CLICK_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&password=${VNC_PASS}"
+            ONE_CLICK_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&pass=${VNC_PASS}"
             echo "================================================================================"
             echo "🎉 INTERACTIVE GUI SESSION IS READY (Linux)!"
             echo ""
@@ -341,6 +419,11 @@ jobs:
             echo "   VNC Password: $VNC_PASS"
             echo "   Session timeout: 25 minutes (auto-closes if unattended)"
             echo "================================================================================"
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              echo "### 🖥️ Interactive GUI Session is Live (Linux)!" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Direct One-Click URL**: [$ONE_CLICK_URL]($ONE_CLICK_URL)" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **VNC Password**: \`$VNC_PASS\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
             echo "::warning::Cloudflare tunnel URL could not be detected. Showing cloudflared log:"
             cat /tmp/cloudflared.log || true
