@@ -124,13 +124,17 @@ jobs:
           git clone --depth 1 https://github.com/novnc/websockify.git /tmp/websockify
           chmod +x /tmp/websockify/run
 
-          # Ensure vnc.html and index.html point to ard.html for maximum compatibility
-          cp /tmp/novnc/ard.html /tmp/novnc/vnc.html
+          # Ensure vnc.html and index.html are available
+          if [ -f /tmp/novnc/noVNC/vnc.html ]; then
+            cp /tmp/novnc/noVNC/vnc.html /tmp/novnc/vnc.html
+          elif [ ! -f /tmp/novnc/vnc.html ]; then
+            cp /tmp/novnc/ard.html /tmp/novnc/vnc.html
+          fi
           cp /tmp/novnc/ard.html /tmp/novnc/index.html
 
           # Inject parameter normalizer script into HTML heads:
           # Auto-fills username, handles 'pass'/'pwd', replaces GitHub log-masked '***' with true password,
-          # and ensures autoconnect + ardSessionType=share are set before noVNC initializes.
+          # and ensures autoconnect + resize=scale are set before noVNC initializes.
           python3 -c "
           import os
           script = '''<script>
@@ -139,14 +143,22 @@ jobs:
           if (!p.get('username')) { p.set('username', '${VNC_USER}'); c = true; }
           if (!p.get('password') || p.get('password') === '***') { p.set('password', p.get('pass') || p.get('pwd') || '${VNC_PASS}'); c = true; }
           if (!p.get('autoconnect')) { p.set('autoconnect', 'true'); c = true; }
-          if (!p.get('ardSessionType')) { p.set('ardSessionType', 'share'); c = true; }
+          if (!p.get('resize')) { p.set('resize', 'scale'); c = true; }
           if (c && window.history.replaceState) { window.history.replaceState({}, '', window.location.pathname + '?' + p.toString()); }
+          window.addEventListener('DOMContentLoaded', () => {
+            setInterval(() => {
+              const userInput = document.getElementById('noVNC_username_input') || document.querySelector('input[type=text]');
+              const passInput = document.getElementById('noVNC_password_input') || document.querySelector('input[type=password]');
+              if (userInput && !userInput.value) { userInput.value = '${VNC_USER}'; }
+              if (passInput && !passInput.value) { passInput.value = '${VNC_PASS}'; }
+            }, 500);
+          });
           </script>'''
           for fpath in ['/tmp/novnc/ard.html', '/tmp/novnc/vnc.html', '/tmp/novnc/index.html']:
               if os.path.exists(fpath):
                   with open(fpath, 'r', encoding='utf-8') as f:
                       content = f.read()
-                  if '<head>' in content and 'ardSessionType' not in content:
+                  if '<head>' in content and 'URLSearchParams' not in content:
                       content = content.replace('<head>', '<head>\n' + script)
                       with open(fpath, 'w', encoding='utf-8') as f:
                           f.write(content)
@@ -154,7 +166,7 @@ jobs:
 
           # 2. Create fresh local admin user with known password (avoids eDSAuthFailed on runner)
           echo "Setting up dedicated local user '$VNC_USER'..."
-          sudo dscl . -delete /Users/"$VNC_USER" 2>/dev/null || true
+          sudo dscl . -delete /Users/"$VNC_USER" >/dev/null 2>&1 || true
           sudo dscl . -create /Users/"$VNC_USER"
           sudo dscl . -create /Users/"$VNC_USER" UserShell /bin/bash
           sudo dscl . -create /Users/"$VNC_USER" RealName "VNC User"
@@ -175,10 +187,7 @@ jobs:
             sudo dscl . -passwd /Users/"$VNC_USER" "$VNC_PASS"
           fi
 
-          # Configure auto-login & prevent display sleep (fixes headless black screen)
-          sudo sysadminctl -setAutoLogin -enable -user "$VNC_USER" -password "$VNC_PASS" 2>/dev/null || true
-          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$VNC_USER" 2>/dev/null || true
-          sudo defaults write /Library/Preferences/com.apple.loginwindow lastUser -string "$VNC_USER" 2>/dev/null || true
+          # Prevent display sleep and wake session (fixes headless black screen)
           sudo defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
           sudo defaults write com.apple.screensaver loginWindowIdleTime 0 2>/dev/null || true
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null || true
@@ -195,18 +204,13 @@ jobs:
           echo -n "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "\%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
           sudo chmod 400 /Library/Preferences/com.apple.VNCSettings.txt
 
-          # 5. Activate Apple Remote Desktop with legacy VNC and access for all users
+          # 5. Activate Apple Remote Desktop with legacy VNC and prompt disabled
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -configure -users "$VNC_USER",runner -privs -all \
             -configure -allowAccessFor -allUsers -privs -all \
-            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" \
+            -configure -clientopts -setreqperm -reqperm no -setmenuextra -menuextra yes -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" \
             -restart -agent -console
-
-          # Cycle loginwindow so vncuser is logged into an active Aqua GUI desktop
-          echo "Cycling loginwindow to initialize desktop session..."
-          sudo killall loginwindow 2>/dev/null || true
-          sleep 3
 
           # Background watcher to auto-accept any Screen Sharing / Remote Management prompts
           (
@@ -255,6 +259,7 @@ jobs:
           ./tiktok-tts-app &
 
           # Wake display and activate windows
+          open -a Finder || true
           osascript -e 'tell application "System Events" to key code 123' 2>/dev/null || true
           osascript -e 'tell application "Simulator" to activate' 2>/dev/null || true
 
@@ -293,14 +298,14 @@ jobs:
           done
 
           if [ -n "$TUNNEL_URL" ]; then
-            ONE_CLICK_URL="${TUNNEL_URL}/ard.html?autoconnect=true&ardSessionType=share&username=${VNC_USER}&pass=${VNC_PASS}"
-            FALLBACK_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&ardSessionType=share&username=${VNC_USER}&pass=${VNC_PASS}"
+            ONE_CLICK_URL="${TUNNEL_URL}/ard.html?autoconnect=true&resize=scale&username=${VNC_USER}&pass=${VNC_PASS}"
+            FALLBACK_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=scale&pass=${VNC_PASS}"
             echo "================================================================================"
             echo "🎉 INTERACTIVE GUI SESSION IS READY (macOS)!"
             echo ""
             echo "👉 Direct one-click browser URL (Apple Remote Desktop Web Client):"
             echo "   $ONE_CLICK_URL"
-            echo "   (Fallback link: $FALLBACK_URL)"
+            echo "   (Fallback Standard VNC link: $FALLBACK_URL)"
             echo ""
             echo "   VNC Username: $VNC_USER"
             echo "   VNC Password: $VNC_PASS"
@@ -308,10 +313,10 @@ jobs:
             echo "================================================================================"
             if [ -n "$GITHUB_STEP_SUMMARY" ]; then
               echo "### 🖥️ Interactive GUI Session is Live (macOS)!" >> "$GITHUB_STEP_SUMMARY"
-              echo "- **Direct One-Click URL**: [$ONE_CLICK_URL]($ONE_CLICK_URL)" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Direct One-Click URL (ARD Web Client)**: [$ONE_CLICK_URL]($ONE_CLICK_URL)" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Fallback Standard VNC URL**: [$FALLBACK_URL]($FALLBACK_URL)" >> "$GITHUB_STEP_SUMMARY"
               echo "- **VNC Username**: \`$VNC_USER\`" >> "$GITHUB_STEP_SUMMARY"
               echo "- **VNC Password**: \`$VNC_PASS\`" >> "$GITHUB_STEP_SUMMARY"
-              echo "- **Fallback URL**: [$FALLBACK_URL]($FALLBACK_URL)" >> "$GITHUB_STEP_SUMMARY"
             fi
           else
             echo "::warning::Cloudflare tunnel URL could not be detected. Showing cloudflared log:"
