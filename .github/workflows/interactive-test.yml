@@ -175,6 +175,18 @@ jobs:
             sudo dscl . -passwd /Users/"$VNC_USER" "$VNC_PASS"
           fi
 
+          # Configure auto-login & prevent display sleep (fixes headless black screen)
+          sudo sysadminctl -setAutoLogin -enable -user "$VNC_USER" -password "$VNC_PASS" 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$VNC_USER" 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.loginwindow lastUser -string "$VNC_USER" 2>/dev/null || true
+          sudo defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+          sudo defaults write com.apple.screensaver loginWindowIdleTime 0 2>/dev/null || true
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 2>/dev/null || true
+          caffeinate -u -d -t 3600 &
+
+          # Reset TCC screen capture cache so Remote Management is not blocked
+          sudo tccutil reset ScreenCapture 2>/dev/null || true
+
           # 3. Enable launchd screensharing daemon explicitly
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
@@ -190,6 +202,34 @@ jobs:
             -configure -allowAccessFor -allUsers -privs -all \
             -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASS" \
             -restart -agent -console
+
+          # Cycle loginwindow so vncuser is logged into an active Aqua GUI desktop
+          echo "Cycling loginwindow to initialize desktop session..."
+          sudo killall loginwindow 2>/dev/null || true
+          sleep 3
+
+          # Background watcher to auto-accept any Screen Sharing / Remote Management prompts
+          (
+            while true; do
+              osascript -e '
+                tell application "System Events"
+                  repeat with p in {"Screen Sharing", "ScreenSharingAgent", "SecurityAgent", "System Events", "UserNotificationCenter"}
+                    try
+                      tell process p
+                        repeat with b in {"Share Display", "Share", "Accept", "Allow", "Connect", "OK"}
+                          try
+                            click button b of window 1
+                          end try
+                        end repeat
+                      end tell
+                    end try
+                  end repeat
+                end tell
+              ' 2>/dev/null || true
+              sleep 1
+            done
+          ) &
+          AUTO_CLICK_PID=$!
 
           # 6. Verify local VNC port 5900 is listening
           echo "Verifying local VNC is listening on port 5900..."
@@ -213,6 +253,10 @@ jobs:
           fi
           open -a Simulator || true
           ./tiktok-tts-app &
+
+          # Wake display and activate windows
+          osascript -e 'tell application "System Events" to key code 123' 2>/dev/null || true
+          osascript -e 'tell application "Simulator" to activate' 2>/dev/null || true
 
           # 8. Start websockify proxy for noVNC-ARD on port 6080 (run is a shell script, not python)
           /tmp/websockify/run --web /tmp/novnc 6080 127.0.0.1:5900 &
@@ -290,6 +334,7 @@ jobs:
           wait "$TUNNEL_PID" 2>/dev/null || true
           kill -TERM "$WEBSOCKIFY_PID" 2>/dev/null || true
           kill -TERM "$TAIL_PID" 2>/dev/null || true
+          kill -TERM "$AUTO_CLICK_PID" 2>/dev/null || true
 
       - name: Start Browser VNC Session (Linux)
         if: runner.os == 'Linux'
