@@ -149,8 +149,15 @@ impl TikTokWeb {
 
         if status != 200 {
             let detail = String::from_utf8_lossy(&bytes);
+            let lower = detail.to_ascii_lowercase();
             return Err(if status == 429 {
                 LiveError::RateLimited { status }
+            } else if status == 404
+                || lower.contains("not live")
+                || lower.contains("user_offline")
+                || lower.contains("room_not_found")
+            {
+                LiveError::UserOffline(room_id.to_string())
             } else {
                 LiveError::Signing(format!("HTTP {status}: {detail}"))
             });
@@ -253,7 +260,7 @@ impl TikTokWeb {
             }
         };
 
-        if body.status_code == Some(19881007) {
+        if matches!(body.status_code, Some(19881007 | 10202 | 10221)) {
             return Err(LiveError::UserNotFound(unique_id));
         }
         if let Some(code) = body.status_code.filter(|c| *c != 0) {
@@ -357,9 +364,25 @@ impl TikTokWeb {
                         if let Some(scope) = v.get("__DEFAULT_SCOPE__") {
                             let live_detail = scope.get("webapp.live-detail");
                             let user_detail = scope.get("webapp.user-detail");
+                            let status_code = live_detail
+                                .and_then(|d| d.get("statusCode"))
+                                .and_then(|c| c.as_i64())
+                                .or_else(|| {
+                                    user_detail
+                                        .and_then(|d| d.get("statusCode"))
+                                        .and_then(|c| c.as_i64())
+                                });
+                            if matches!(status_code, Some(19881007 | 10202 | 10221)) {
+                                return Err(LiveError::UserNotFound(unique_id.to_string()));
+                            }
                             let room_info = live_detail
                                 .and_then(|d| d.get("liveRoom"))
-                                .or_else(|| user_detail.and_then(|d| d.get("liveRoom")));
+                                .or_else(|| user_detail.and_then(|d| d.get("liveRoom")))
+                                .or_else(|| {
+                                    user_detail
+                                        .and_then(|d| d.get("userInfo"))
+                                        .and_then(|u| u.get("liveRoom"))
+                                });
 
                             if let Some(live_room) = room_info {
                                 let room_id = live_room
@@ -392,24 +415,41 @@ impl TikTokWeb {
                                     .and_then(|c| c.as_u64())
                                     .unwrap_or(0);
 
-                                if !room_id.is_empty() {
-                                    return Ok(RoomStatus {
-                                        room_id,
-                                        is_live,
-                                        title,
-                                        viewer_count: user_count,
-                                        owner: RoomOwner {
-                                            user_id: String::new(),
-                                            unique_id: unique_id.to_string(),
-                                            nickname: unique_id.to_string(),
-                                            profile_picture_url: String::new(),
-                                            follower_count: 0,
-                                        },
-                                        stream_started_at: None,
-                                        cover_url: None,
-                                        hls_url: None,
-                                    });
-                                }
+                                return Ok(RoomStatus {
+                                    room_id,
+                                    is_live,
+                                    title,
+                                    viewer_count: user_count,
+                                    owner: RoomOwner {
+                                        user_id: String::new(),
+                                        unique_id: unique_id.to_string(),
+                                        nickname: unique_id.to_string(),
+                                        profile_picture_url: String::new(),
+                                        follower_count: 0,
+                                    },
+                                    stream_started_at: None,
+                                    cover_url: None,
+                                    hls_url: None,
+                                });
+                            }
+
+                            if user_detail.and_then(|d| d.get("userInfo")).is_some() {
+                                return Ok(RoomStatus {
+                                    room_id: String::new(),
+                                    is_live: false,
+                                    title: String::new(),
+                                    viewer_count: 0,
+                                    owner: RoomOwner {
+                                        user_id: String::new(),
+                                        unique_id: unique_id.to_string(),
+                                        nickname: unique_id.to_string(),
+                                        profile_picture_url: String::new(),
+                                        follower_count: 0,
+                                    },
+                                    stream_started_at: None,
+                                    cover_url: None,
+                                    hls_url: None,
+                                });
                             }
                         }
                     }

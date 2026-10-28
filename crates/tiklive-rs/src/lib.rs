@@ -17,8 +17,8 @@ pub mod proto;
 pub mod web;
 
 pub use connection::{
-    ConnectOptions, ConnectionEvent, DisconnectReason, LiveClient, LiveSession, SessionControl,
-    DEFAULT_WS_HOSTS,
+    ConnectOptions, ConnectionEvent, DisconnectReason, ErrorKind, LiveClient, LiveSession,
+    SessionControl, DEFAULT_WS_HOSTS,
 };
 pub use error::{LiveError, Result};
 pub use events::{Emote, GiftReceiver, LiveEvent, LiveUser, RoomOwner, RoomStatus, TopViewer};

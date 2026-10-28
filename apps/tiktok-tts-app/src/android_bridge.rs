@@ -204,16 +204,17 @@ impl crate::audio_sink::AudioSink for AndroidAudioSink {
         seq: u64,
         samples: &[f32],
         sample_rate: u32,
+        volume: f32,
         _cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), String> {
         #[cfg(target_os = "android")]
         {
-            let pcm = crate::audio_sink::samples_to_pcm16_le(samples);
+            let pcm = crate::audio_sink::samples_to_pcm16_le_with_volume(samples, volume);
             call_kotlin_play_audio(&pcm, sample_rate, seq)
         }
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (seq, samples, sample_rate, _cancel);
+            let _ = (seq, samples, sample_rate, volume, _cancel);
             Ok(())
         }
     }

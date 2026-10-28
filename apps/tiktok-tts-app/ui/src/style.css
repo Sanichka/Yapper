@@ -180,12 +180,14 @@ button {
   animation: pulse 2.2s ease-in-out infinite;
 }
 .status-connecting,
+.status-waiting,
 .status-reconnecting {
   border-color: rgba(242, 184, 75, 0.4);
   background: var(--amber-soft);
   color: var(--amber);
 }
 .status-connecting i,
+.status-waiting i,
 .status-reconnecting i {
   background: var(--amber);
   animation: pulse 1.1s ease-in-out infinite;
@@ -446,6 +448,36 @@ button {
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+.waiting-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(242, 184, 75, 0.28);
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.waiting-status b {
+  font-weight: 500;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.waiting-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(242, 184, 75, 0.18);
+  flex-shrink: 0;
+  animation: pulse 1.2s ease-in-out infinite;
 }
 
 .room {

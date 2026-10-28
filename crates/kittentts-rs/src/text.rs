@@ -23,6 +23,10 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("space regex"));
 
+fn default_volume() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TtsSettings {
@@ -30,6 +34,8 @@ pub struct TtsSettings {
     pub language: String,
     pub voice: String,
     pub speed: f32,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
     /// Chat template, e.g. `"{user} says: {text}"`.
     pub template: String,
     pub blacklist: Vec<String>,
@@ -52,6 +58,7 @@ impl Default for TtsSettings {
             language: language::AUTO.into(),
             voice: "Bella".into(),
             speed: 1.0,
+            volume: default_volume(),
             template: "{user} says: {text}".into(),
             blacklist: Vec::new(),
             max_len: MAX_LEN,

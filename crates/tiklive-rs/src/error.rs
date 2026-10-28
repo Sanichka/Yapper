@@ -31,3 +31,16 @@ pub enum LiveError {
     #[error(transparent)]
     Url(#[from] url::ParseError),
 }
+
+impl LiveError {
+    /// Returns `true` when the error indicates the target user or room is offline.
+    pub fn is_offline(&self) -> bool {
+        matches!(self, Self::UserOffline(_))
+    }
+
+    /// Returns `true` when the error indicates the TikTok user does not exist.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::UserNotFound(_))
+    }
+}
+

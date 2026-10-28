@@ -15,8 +15,8 @@ use kittentts_rs::{
 };
 use serde::{Deserialize, Serialize};
 use tiklive_rs::{
-    normalize_username, ConnectOptions, ConnectionEvent, DisconnectReason, LiveClient, LiveEvent,
-    LiveSession, RoomStatus, SessionControl,
+    normalize_username, ConnectOptions, ConnectionEvent, DisconnectReason, ErrorKind, LiveClient,
+    LiveError, LiveEvent, RoomStatus, SessionControl,
 };
 use tokio::sync::{broadcast, watch, Notify};
 
@@ -27,6 +27,8 @@ use crate::config::{self, PersistedConfig};
 pub enum ConnStatus {
     Idle,
     Connecting,
+    #[serde(rename = "waiting")]
+    WaitingForStream,
     Live,
     Reconnecting,
     Offline,
@@ -139,6 +141,7 @@ pub struct Core {
     pipeline: TextPipeline,
     connection: Mutex<ConnectionState>,
     session: Mutex<Option<SessionControl>>,
+    conn_cancel: Mutex<Option<Arc<Notify>>>,
     generation: AtomicU64,
     paused: AtomicBool,
     wake: Notify,
@@ -196,6 +199,7 @@ impl Core {
             pipeline: TextPipeline::new(),
             connection: Mutex::new(ConnectionState::default()),
             session: Mutex::new(None),
+            conn_cancel: Mutex::new(None),
             generation: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             wake: Notify::new(),
@@ -361,6 +365,11 @@ impl Core {
             next.voice = "Bella".into();
         }
         next.speed = next.speed.clamp(0.5, 2.0);
+        next.volume = if next.volume.is_finite() {
+            next.volume.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         next.max_len = next.max_len.clamp(10, 500);
         next.cooldown_secs = next.cooldown_secs.min(60);
         next.min_gift_diamonds = next.min_gift_diamonds.min(1_000_000);
@@ -382,6 +391,7 @@ impl Core {
                 .config
                 .lock()
                 .map_err(|_| "config lock was poisoned".to_string())?;
+            config.volume = next.volume;
             config.settings = next;
         }
         self.pipeline.reset_cooldowns();
@@ -445,7 +455,10 @@ impl Core {
         }
         let is_active = matches!(
             next.status,
-            ConnStatus::Connecting | ConnStatus::Live | ConnStatus::Reconnecting
+            ConnStatus::Connecting
+                | ConnStatus::WaitingForStream
+                | ConnStatus::Live
+                | ConnStatus::Reconnecting
         );
         if let Ok(mut state) = self.connection.lock() {
             *state = next;
@@ -490,21 +503,23 @@ impl Core {
 
         let client = LiveClient::new(None)
             .map_err(|error| format!("could not create the TikTok client: {error}"))?;
-        let session = client.connect(&username, ConnectOptions::default());
-        let control = session.control();
-        if let Ok(mut slot) = self.session.lock() {
-            *slot = Some(control);
+        let cancel = Arc::new(Notify::new());
+        if let Ok(mut slot) = self.conn_cancel.lock() {
+            *slot = Some(cancel.clone());
         }
 
         let core = self.clone();
         tokio::spawn(async move {
-            core.pump(generation, username, session).await;
+            core.pump(generation, username, client, cancel).await;
         });
         Ok(())
     }
 
     pub fn disconnect(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancel) = self.conn_cancel.lock().ok().and_then(|mut c| c.take()) {
+            cancel.notify_waiters();
+        }
         if let Some(control) = self.session.lock().ok().and_then(|mut s| s.take()) {
             control.disconnect();
         }
@@ -522,103 +537,236 @@ impl Core {
         self.emit_state();
     }
 
-    async fn pump(self: Arc<Self>, generation: u64, username: String, mut session: LiveSession) {
+    async fn pump(
+        self: Arc<Self>,
+        generation: u64,
+        username: String,
+        client: LiveClient,
+        cancel: Arc<Notify>,
+    ) {
         let mut last_error: Option<String> = None;
-        while let Some(event) = session.recv().await {
+        let mut initial_room: Option<RoomStatus> = None;
+
+        'outer: loop {
             if !self.is_current(generation) {
                 return;
             }
-            match event {
-                ConnectionEvent::Connected { room_id, room, .. } => {
-                    let mut room = room;
-                    if room.is_none() {
-                        room = Some(RoomStatus {
-                            room_id,
-                            is_live: true,
-                            ..Default::default()
-                        });
-                    }
-                    self.set_connection(
-                        generation,
-                        ConnectionState {
-                            status: ConnStatus::Live,
-                            username: username.clone(),
-                            room,
-                            error: None,
-                        },
-                    );
-                    self.log("info", format!("connected to @{username}'s LIVE"));
+
+            let mut options = ConnectOptions::default();
+            if let Some(ref room) = initial_room {
+                if !room.room_id.is_empty() {
+                    options.room_id = Some(room.room_id.clone());
                 }
-                ConnectionEvent::Event(event) => match event {
-                    LiveEvent::StreamEnd { reason, .. } => {
-                        self.set_connection(
-                            generation,
-                            ConnectionState {
-                                status: ConnStatus::Offline,
-                                username: username.clone(),
-                                room: None,
-                                error: Some(if reason.is_empty() {
-                                    "the LIVE ended".into()
-                                } else {
-                                    format!("LIVE ended: {reason}")
-                                }),
-                            },
-                        );
-                        break;
+            }
+
+            let mut session = client.connect(&username, options);
+            if let Ok(mut slot) = self.session.lock() {
+                *slot = Some(session.control());
+            }
+
+            let mut should_poll_offline = false;
+            let mut offline_message: Option<String> = None;
+
+            loop {
+                let next_event = tokio::select! {
+                    ev = session.recv() => ev,
+                    _ = cancel.notified() => {
+                        session.disconnect();
+                        return;
                     }
-                    other => self.handle_live_event(other),
-                },
-                ConnectionEvent::Disconnected {
-                    reason,
-                    will_reconnect,
-                    detail,
-                } => {
-                    if will_reconnect {
-                        last_error = detail.clone();
-                        self.set_connection(
-                            generation,
-                            ConnectionState {
-                                status: ConnStatus::Reconnecting,
-                                username: username.clone(),
-                                room: None,
-                                error: detail,
-                            },
-                        );
-                    } else {
-                        let message = detail.unwrap_or_else(|| match reason {
-                            DisconnectReason::StreamEnd => "the LIVE ended".into(),
-                            DisconnectReason::Offline => "the streamer is offline".into(),
-                            DisconnectReason::Network => "connection lost".into(),
-                        });
-                        let status = if reason == DisconnectReason::Offline {
-                            ConnStatus::Offline
-                        } else {
-                            ConnStatus::Error
-                        };
-                        last_error = Some(message.clone());
-                        self.set_connection(
-                            generation,
-                            ConnectionState {
-                                status,
-                                username: username.clone(),
-                                room: None,
-                                error: Some(message),
-                            },
-                        );
-                    }
-                }
-                ConnectionEvent::Error { message, .. } => {
-                    last_error = Some(message.clone());
-                    self.set_connection(
-                        generation,
-                        ConnectionState {
-                            status: ConnStatus::Error,
-                            username: username.clone(),
-                            room: None,
-                            error: Some(message),
-                        },
-                    );
+                };
+                let Some(event) = next_event else {
                     break;
+                };
+                if !self.is_current(generation) {
+                    session.disconnect();
+                    return;
+                }
+
+                match event {
+                    ConnectionEvent::Connected { room_id, room, .. } => {
+                        let room = room.or_else(|| initial_room.take()).or_else(|| {
+                            Some(RoomStatus {
+                                room_id,
+                                is_live: true,
+                                ..Default::default()
+                            })
+                        });
+                        last_error = None;
+                        self.set_connection(
+                            generation,
+                            ConnectionState {
+                                status: ConnStatus::Live,
+                                username: username.clone(),
+                                room,
+                                error: None,
+                            },
+                        );
+                        self.log("info", format!("connected to @{username}'s LIVE"));
+                    }
+                    ConnectionEvent::Event(event) => match event {
+                        LiveEvent::StreamEnd { reason, .. } => {
+                            let msg = if reason.is_empty() {
+                                format!("Waiting for @{username} to go live...")
+                            } else {
+                                format!("LIVE ended ({reason}) • Waiting for @{username} to go live...")
+                            };
+                            self.log("info", format!("@{username}'s LIVE ended; waiting for next stream"));
+                            should_poll_offline = true;
+                            offline_message = Some(msg);
+                            break;
+                        }
+                        other => self.handle_live_event(other),
+                    },
+                    ConnectionEvent::Disconnected {
+                        reason,
+                        will_reconnect,
+                        detail,
+                    } => {
+                        if will_reconnect {
+                            last_error = detail.clone();
+                            self.set_connection(
+                                generation,
+                                ConnectionState {
+                                    status: ConnStatus::Reconnecting,
+                                    username: username.clone(),
+                                    room: None,
+                                    error: detail,
+                                },
+                            );
+                        } else if matches!(
+                            reason,
+                            DisconnectReason::Offline | DisconnectReason::StreamEnd
+                        ) {
+                            should_poll_offline = true;
+                            offline_message =
+                                Some(format!("Waiting for @{username} to go live..."));
+                            break;
+                        } else {
+                            let message = detail.unwrap_or_else(|| "connection lost".into());
+                            last_error = Some(message.clone());
+                            self.set_connection(
+                                generation,
+                                ConnectionState {
+                                    status: ConnStatus::Error,
+                                    username: username.clone(),
+                                    room: None,
+                                    error: Some(message),
+                                },
+                            );
+                            break 'outer;
+                        }
+                    }
+                    ConnectionEvent::Error { message, kind } => {
+                        if kind == ErrorKind::Offline {
+                            should_poll_offline = true;
+                            offline_message =
+                                Some(format!("Waiting for @{username} to go live..."));
+                            break;
+                        } else {
+                            last_error = Some(message.clone());
+                            self.set_connection(
+                                generation,
+                                ConnectionState {
+                                    status: ConnStatus::Error,
+                                    username: username.clone(),
+                                    room: None,
+                                    error: Some(message),
+                                },
+                            );
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            session.disconnect();
+            if let Ok(mut slot) = self.session.lock() {
+                *slot = None;
+            }
+            initial_room = None;
+
+            if !self.is_current(generation) {
+                return;
+            }
+
+            if !should_poll_offline {
+                break 'outer;
+            }
+
+            let wait_msg = offline_message
+                .unwrap_or_else(|| format!("Waiting for @{username} to go live..."));
+            self.set_connection(
+                generation,
+                ConnectionState {
+                    status: ConnStatus::WaitingForStream,
+                    username: username.clone(),
+                    room: None,
+                    error: Some(wait_msg),
+                },
+            );
+
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = cancel.notified() => return,
+                }
+                if !self.is_current(generation) {
+                    return;
+                }
+
+                let check = tokio::select! {
+                    res = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        client.web().room_status(&username),
+                    ) => res,
+                    _ = cancel.notified() => return,
+                };
+                if !self.is_current(generation) {
+                    return;
+                }
+
+                match check {
+                    Ok(Ok(room)) if room.is_live && !room.room_id.is_empty() => {
+                        self.log(
+                            "info",
+                            format!("@{username} is now LIVE — connecting..."),
+                        );
+                        self.set_connection(
+                            generation,
+                            ConnectionState {
+                                status: ConnStatus::Connecting,
+                                username: username.clone(),
+                                room: Some(room.clone()),
+                                error: None,
+                            },
+                        );
+                        initial_room = Some(room);
+                        continue 'outer;
+                    }
+                    Ok(Ok(_)) | Ok(Err(LiveError::UserOffline(_))) => {
+                        // Streamer is still offline; keep polling every 5 seconds.
+                    }
+                    Ok(Err(err)) if err.is_not_found() => {
+                        let msg = err.to_string();
+                        last_error = Some(msg.clone());
+                        self.set_connection(
+                            generation,
+                            ConnectionState {
+                                status: ConnStatus::Error,
+                                username: username.clone(),
+                                room: None,
+                                error: Some(msg),
+                            },
+                        );
+                        break 'outer;
+                    }
+                    Ok(Err(err)) => {
+                        tracing::debug!("poll check for @{username} failed: {err}");
+                    }
+                    Err(_) => {
+                        tracing::debug!("poll check for @{username} timed out");
+                    }
                 }
             }
         }
@@ -629,10 +777,16 @@ impl Core {
         if let Ok(mut slot) = self.session.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.conn_cancel.lock() {
+            *slot = None;
+        }
         if let Ok(mut state) = self.connection.lock() {
             if matches!(
                 state.status,
-                ConnStatus::Live | ConnStatus::Reconnecting | ConnStatus::Connecting
+                ConnStatus::Live
+                    | ConnStatus::WaitingForStream
+                    | ConnStatus::Reconnecting
+                    | ConnStatus::Connecting
             ) {
                 state.status = if last_error.is_some() {
                     ConnStatus::Error
@@ -643,6 +797,7 @@ impl Core {
                 state.error = last_error;
             }
         }
+        self.sync_mobile_notification();
         self.emit_state();
     }
 
@@ -944,7 +1099,10 @@ impl Core {
             )
         };
         let is_paused = self.paused.load(Ordering::SeqCst);
-        let is_connected = status == ConnStatus::Live;
+        let is_connected = matches!(
+            status,
+            ConnStatus::Live | ConnStatus::WaitingForStream | ConnStatus::Reconnecting
+        );
 
         let title = match status {
             ConnStatus::Live => {
@@ -955,6 +1113,7 @@ impl Core {
                 }
             }
             ConnStatus::Connecting => format!("Yapper • Connecting to @{username}..."),
+            ConnStatus::WaitingForStream => format!("Yapper • Waiting for @{username}..."),
             ConnStatus::Reconnecting => format!("Yapper • Reconnecting to @{username}..."),
             ConnStatus::Offline => "Yapper • Stream Offline".to_string(),
             ConnStatus::Error => "Yapper • Connection Error".to_string(),
@@ -979,6 +1138,8 @@ impl Core {
             format!("{}: {} (Queue: {queue_depth})", item.user, item.raw)
         } else if queue_depth > 0 {
             format!("Queue: {queue_depth} message(s) waiting")
+        } else if status == ConnStatus::WaitingForStream {
+            format!("Waiting for @{username} to go live (checking every 5s)...")
         } else {
             "Listening to live stream...".to_string()
         };
@@ -1149,7 +1310,8 @@ impl Core {
 
                     if let Some(sink) = &self.audio_sink {
                         let cancel = self.playback_cancel.clone();
-                        if let Err(e) = sink.play(seq, &samples, sample_rate, cancel) {
+                        let volume = self.settings().volume;
+                        if let Err(e) = sink.play(seq, &samples, sample_rate, volume, cancel) {
                             tracing::error!("Audio sink playback error: {e}");
                         }
                     }
@@ -1432,6 +1594,27 @@ mod tests {
 
         let samples = core.synthesize_item(&item).await.unwrap();
         assert!(!samples.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persists_and_clamps_volume_and_serializes_waiting_status() {
+        let (path, dir) = temp_config("volume");
+        let core = Core::new(path.clone(), Some(dir.join("missing-model")), false).unwrap();
+        assert!((core.state().settings.volume - 1.0).abs() < f32::EPSILON);
+
+        let mut settings = core.settings();
+        settings.volume = 0.42;
+        core.update_settings(settings).unwrap();
+        assert!((core.state().settings.volume - 0.42).abs() < 1e-6);
+
+        let persisted = PersistedConfig::load(&path);
+        assert!((persisted.volume - 0.42).abs() < 1e-6);
+        assert!((persisted.settings.volume - 0.42).abs() < 1e-6);
+
+        let waiting_json = serde_json::to_string(&ConnStatus::WaitingForStream).unwrap();
+        assert_eq!(waiting_json, "\"waiting\"");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

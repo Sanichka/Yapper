@@ -142,6 +142,11 @@ function applyState(next: AppStateDto): void {
     lastStatus = next.connection.status;
     if (next.connection.status === "live") {
       toast(`Connected to @${next.connection.username}`);
+    } else if (next.connection.status === "waiting") {
+      toast(
+        next.connection.error ??
+          `Waiting for @${next.connection.username} to go live…`,
+      );
     } else if (next.connection.status === "error") {
       toast(next.connection.error ?? "Connection failed", "error");
     } else if (next.connection.status === "offline") {
@@ -204,6 +209,7 @@ function renderStatus(): void {
   const labels: Record<ConnStatus, string> = {
     idle: "Not connected",
     connecting: "Connecting…",
+    waiting: "Waiting for live…",
     live: "LIVE",
     reconnecting: "Reconnecting…",
     offline: "Stream offline",
@@ -223,6 +229,7 @@ function renderConnection(): void {
   const busy = connection.status === "connecting";
   const connected =
     connection.status === "live" ||
+    connection.status === "waiting" ||
     connection.status === "reconnecting" ||
     connection.status === "offline" ||
     connection.status === "error";
@@ -230,7 +237,8 @@ function renderConnection(): void {
   if (document.activeElement !== input) {
     if (!input.value && connection.username) input.value = connection.username;
   }
-  input.disabled = busy || connection.status === "live";
+  input.disabled =
+    busy || connection.status === "live" || connection.status === "waiting";
   button.disabled = busy;
   button.textContent = busy ? "Cancel" : connected ? "Disconnect" : "Connect";
   button.classList.toggle("btn-primary", !connected);
@@ -250,6 +258,15 @@ function renderConnection(): void {
           <span class="room-viewers">${viewers} watching</span>
         </div>
         <div class="room-title">${esc(room.title || "Untitled LIVE")}</div>
+      </div>`;
+  } else if (connection.status === "waiting") {
+    meta.innerHTML = `
+      <div class="waiting-status">
+        <span class="waiting-dot"></span>
+        <span>${esc(
+          connection.error ??
+            `Waiting for @${connection.username} to go live…`,
+        )} <b>· checking every 5s</b></span>
       </div>`;
   } else if (connection.status === "error" || connection.status === "reconnecting") {
     meta.innerHTML = `<p class="connect-error">${esc(
@@ -352,6 +369,21 @@ function renderVoice(): void {
   $("#speed-value").textContent = `${Number(
     settingsDirty ? speed.value : state.settings.speed,
   ).toFixed(2)}×`;
+
+  const volume = $<HTMLInputElement>("#volume");
+  const savedVolume = Number.isFinite(state.settings.volume)
+    ? clamp(state.settings.volume, 0, 1)
+    : 1;
+  if (document.activeElement !== volume && !settingsDirty) {
+    volume.value = savedVolume.toFixed(2);
+  }
+  const activeVolume = clamp(
+    Number(settingsDirty ? volume.value : savedVolume),
+    0,
+    1,
+  );
+  $("#volume-value").textContent = `${Math.round(activeVolume * 100)}%`;
+  player.setVolume(activeVolume);
   renderModels();
 }
 
@@ -737,10 +769,14 @@ function bind(): void {
   });
 
   const settingsSelector =
-    "#language, #voice, #speed, #template, #gift-template, #max-len, #cooldown, #min-gift, #blacklist, #read-gifts, #transliterate";
+    "#language, #voice, #speed, #volume, #template, #gift-template, #max-len, #cooldown, #min-gift, #blacklist, #read-gifts, #transliterate";
   document.querySelectorAll(settingsSelector).forEach((element) => {
     element.addEventListener("input", () => {
       if (element.id === "speed") updateSpeedLabel();
+      if (element.id === "volume") {
+        updateVolumeLabel();
+        player.setVolume(Number($<HTMLInputElement>("#volume").value));
+      }
       markSettingsDirty();
     });
     element.addEventListener("change", () => {
@@ -748,6 +784,10 @@ function bind(): void {
         markSettingsDirty();
         renderVoice();
       } else {
+        if (element.id === "volume") {
+          updateVolumeLabel();
+          player.setVolume(Number($<HTMLInputElement>("#volume").value));
+        }
         markSettingsDirty();
       }
     });
@@ -774,6 +814,7 @@ async function toggleConnection(): Promise<void> {
   const status = state.connection.status;
   if (
     status === "live" ||
+    status === "waiting" ||
     status === "reconnecting" ||
     status === "offline" ||
     status === "error"
@@ -930,10 +971,15 @@ function collectSettings(): TtsSettings {
   const language = $<HTMLSelectElement>("#language").value || "auto";
   const voice = $<HTMLSelectElement>("#voice").value;
   const speed = Number($<HTMLInputElement>("#speed").value);
+  const rawVolume = Number($<HTMLInputElement>("#volume").value);
+  const volume = Number.isFinite(rawVolume)
+    ? clamp(rawVolume, 0, 1)
+    : (current?.volume ?? 1);
   return {
     language,
     voice: voice || current?.voice || "Bella",
     speed: clamp(speed, 0.5, 2),
+    volume,
     template: $<HTMLInputElement>("#template").value,
     giftTemplate: $<HTMLInputElement>("#gift-template").value,
     maxLen: clamp(Number($<HTMLInputElement>("#max-len").value) || 150, 10, 500),
@@ -958,6 +1004,11 @@ function collectSettings(): TtsSettings {
 function updateSpeedLabel(): void {
   const speed = Number($<HTMLInputElement>("#speed").value);
   $("#speed-value").textContent = `${speed.toFixed(2)}×`;
+}
+
+function updateVolumeLabel(): void {
+  const volume = clamp(Number($<HTMLInputElement>("#volume").value), 0, 1);
+  $("#volume-value").textContent = `${Math.round(volume * 100)}%`;
 }
 
 function matchesFilter(entry: ActivityEvent): boolean {
@@ -1140,6 +1191,10 @@ function shell(): string {
           <label class="field">
             <span class="field-label">Speed <b id="speed-value">1.00×</b></span>
             <input id="speed" class="range" type="range" min="0.5" max="2" step="0.05" value="1">
+          </label>
+          <label class="field field-wide">
+            <span class="field-label">Volume <b id="volume-value">100%</b></span>
+            <input id="volume" class="range" type="range" min="0" max="1" step="0.01" value="1">
           </label>
         </div>
         <p id="language-note" class="note hidden"></p>

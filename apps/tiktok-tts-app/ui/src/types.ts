@@ -1,6 +1,7 @@
 export type ConnStatus =
   | "idle"
   | "connecting"
+  | "waiting"
   | "live"
   | "reconnecting"
   | "offline"
@@ -44,6 +45,7 @@ export interface TtsSettings {
   language: string;
   voice: string;
   speed: number;
+  volume: number;
   template: string;
   blacklist: string[];
   maxLen: number;

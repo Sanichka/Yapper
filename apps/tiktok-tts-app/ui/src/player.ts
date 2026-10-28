@@ -16,17 +16,35 @@ export class Player {
   private context: AudioContext | null = null;
   private gain: GainNode | null = null;
   private source: AudioBufferSourceNode | null = null;
+  private volume = 1.0;
 
   get suspended(): boolean {
     return this.context?.state === "suspended";
+  }
+
+  getVolume(): number {
+    return this.volume;
+  }
+
+  setVolume(value: number): void {
+    const clamped = Math.min(1, Math.max(0, Number.isFinite(value) ? value : 1));
+    this.volume = clamped;
+    if (this.gain && this.context) {
+      this.gain.gain.setValueAtTime(clamped, this.context.currentTime);
+      this.gain.gain.value = clamped;
+    } else if (this.gain) {
+      this.gain.gain.value = clamped;
+    }
   }
 
   private ensure(): AudioContext {
     if (!this.context) {
       this.context = new AudioContext({ latencyHint: "interactive" });
       this.gain = this.context.createGain();
-      this.gain.gain.value = 0.95;
+      this.gain.gain.value = this.volume;
       this.gain.connect(this.context.destination);
+    } else if (this.gain) {
+      this.gain.gain.value = this.volume;
     }
     return this.context;
   }

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PORT: u16 = 8787;
 pub const MODEL_DIR_NAME: &str = "kitten-tts-mini-0.8";
 
+fn default_volume() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PersistedConfig {
@@ -19,6 +23,8 @@ pub struct PersistedConfig {
     pub model_dir: Option<String>,
     pub server_port: u16,
     pub queue_capacity: usize,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
 }
 
 impl Default for PersistedConfig {
@@ -30,6 +36,7 @@ impl Default for PersistedConfig {
             model_dir: None,
             server_port: DEFAULT_PORT,
             queue_capacity: kittentts_rs::MAX_QUEUE_SIZE,
+            volume: default_volume(),
         }
     }
 }
@@ -37,8 +44,22 @@ impl Default for PersistedConfig {
 impl PersistedConfig {
     pub fn load(path: &Path) -> Self {
         match fs::read_to_string(path) {
-            Ok(raw) => match serde_json::from_str(&raw) {
-                Ok(config) => config,
+            Ok(raw) => match serde_json::from_str::<Self>(&raw) {
+                Ok(mut config) => {
+                    let vol = if (config.settings.volume - 1.0).abs() > f32::EPSILON {
+                        config.settings.volume
+                    } else {
+                        config.volume
+                    };
+                    let clamped = if vol.is_finite() {
+                        vol.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    config.volume = clamped;
+                    config.settings.volume = clamped;
+                    config
+                }
                 Err(error) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -243,5 +264,7 @@ mod tests {
         }"#;
         let config: PersistedConfig = serde_json::from_str(raw).unwrap();
         assert_eq!(config.settings.language, "auto");
+        assert!((config.settings.volume - 1.0).abs() < f32::EPSILON);
+        assert!((config.volume - 1.0).abs() < f32::EPSILON);
     }
 }
