@@ -16,7 +16,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CI: true
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   version:
@@ -27,7 +26,7 @@ jobs:
       tag: ${{ steps.detect.outputs.tag }}
       should_build: ${{ steps.detect.outputs.should_build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -104,9 +103,9 @@ jobs:
             bundles: deb
             artifacts: target/release/bundle/deb/*.deb
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -145,6 +144,36 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: apps/tiktok-tts-app
         run: cargo tauri build --bundles ${{ matrix.bundles }} --ci
+
+      - name: Pre-fetch ONNX Runtime (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORT_HASH="4033efca0e6c1606bd2ec3870d4cb19d0dba0ad0160dbfb616e66cae969ed68c"
+          ORT_URL="https://cdn.pyke.io/0/pyke:ort-rs/ms@1.31.0/aarch64-apple-darwin+coreml.tar.lzma2"
+          ORT_DIR="$HOME/Library/Caches/ort.pyke.io/dfbin/aarch64-apple-darwin/$ORT_HASH"
+          if [ ! -f "$ORT_DIR/libonnxruntime.a" ]; then
+            echo "Downloading ONNX Runtime prebuilt archive via curl..."
+            curl --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 -fSL "$ORT_URL" -o /tmp/ort.tar.lzma2
+            python3 - <<'PY'
+          import hashlib, io, lzma, os, tarfile
+          expected = "4033efca0e6c1606bd2ec3870d4cb19d0dba0ad0160dbfb616e66cae969ed68c"
+          dest = os.path.expanduser(f"~/Library/Caches/ort.pyke.io/dfbin/aarch64-apple-darwin/{expected}")
+          with open("/tmp/ort.tar.lzma2", "rb") as f:
+              data = f.read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"SHA256 mismatch: got {actual}, expected {expected}")
+          dec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 26}])
+          raw_tar = dec.decompress(data)
+          os.makedirs(dest, exist_ok=True)
+          with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as tf:
+              tf.extractall(dest)
+          print("Extracted ONNX Runtime to", dest, os.listdir(dest))
+          PY
+            rm -f /tmp/ort.tar.lzma2
+          fi
 
       - name: Build ${{ matrix.name }} (macOS)
         if: runner.os == 'macOS'
@@ -195,7 +224,7 @@ jobs:
           PY
           exit 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: yapper-${{ matrix.name }}-v${{ needs.version.outputs.version }}
           path: ${{ matrix.artifacts }}
@@ -211,15 +240,15 @@ jobs:
     env:
       NDK_VERSION: 27.0.12077973
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: apps/tiktok-tts-app/ui/package-lock.json
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -290,7 +319,7 @@ jobs:
             mv "$APK_DIR/app-arm64-release.apk" "$APK_DIR/yapper-v${{ needs.version.outputs.version }}-arm64.apk"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: yapper-android-arm64-v${{ needs.version.outputs.version }}
           path: apps/tiktok-tts-app/gen/android/app/build/outputs/apk/**/*.apk
@@ -304,14 +333,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
 
       - name: List release files
         run: find dist -type f -print
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: Yapper ${{ needs.version.outputs.version }}
